@@ -28,6 +28,8 @@ gcc version 15.2.0 (GCC)
 
 Installing the compiler on Windows 11 is done using w64devkit.
 
+
+## Example of building and running  
 PS C:\Users\user\SECD_Scheme8> make clean  
 rm -f micro_scheme9 micro_scheme9.exe  
 PS C:\Users\user\SECD_Scheme8> make  
