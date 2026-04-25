@@ -38,10 +38,10 @@ Installing the compiler on Windows 11 was done using w64devkit.
 
 ## Example of building and running  
 PS C:\Users\user\SECD_Scheme8> make clean  
-rm -f micro_scheme9 micro_scheme9.exe  
+rm -f micro_scheme10 micro_scheme10.exe  
 PS C:\Users\user\SECD_Scheme8> make  
-g++ -std=c++17 -Wall -Wextra -O2 -o micro_scheme9 micro_scheme9.cpp  
-PS C:\Users\user\SECD_Scheme8> .\micro_scheme9.exe  
+g++ -std=c++17 -Wall -Wextra -O2 -o micro_scheme10 micro_scheme10.cpp  
+PS C:\Users\user\SECD_Scheme8> .\micro_scheme10.exe  
 micro-scheme> primes  
 (CLOSURE (LD (0 . 1) LD (0 . 2) CALLG > 2 JZ 8 LD (0 . 0) TCALLG get-all-lst 1 JMP 59 LD (0 . 0) CALLG get-queue-lst 1 LD (0 . 1) LDG is-prime CALL 2 JZ 26 LD (0 . 0) LD (0 . 1) CALLG en-queue! 2 LD (0 . 1) LDC 2 CALLG + 2 LD (0 . 2) LDG primes TCALL 3 JMP 18 LD (0 . 0) LD (0 . 1) LDC 2 CALLG + 2 LD (0 . 2) LDG primes TCALL 3 RTN) NIL)  
 
