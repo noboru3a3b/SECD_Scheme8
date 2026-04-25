@@ -4,7 +4,7 @@ Based on M. Hiroi's Common Lisp implementation of micro schemes, I rewrote it in
 I have built and tested this on clang++ on Ubuntu-24.04 and g++ on Windows 11.
 
 Compiler on Ubuntu:
-$ clang++ -v
+> clang++ -v
 Ubuntu clang version 18.1.3 (1ubuntu1)
 Target: x86_64-pc-linux-gnu
 Thread model: posix
@@ -14,8 +14,9 @@ Found candidate GCC installation: /usr/bin/../lib/gcc/x86_64-linux-gnu/14
 Selected GCC installation: /usr/bin/../lib/gcc/x86_64-linux-gnu/14
 Candidate multilib: .;@m64
 Selected multilib: .;@m64
+
 Compiler on Windows 11:
-$ g++ -v
+> g++ -v
 Using built-in specs.
 COLLECT_GCC=C:\w64devkit\bin\g++.exe
 COLLECT_LTO_WRAPPER=C:/w64devkit/bin/../libexec/gcc/x86_64-w64-mingw32/15.2.0/lto-wrapper.exe
