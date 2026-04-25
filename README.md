@@ -15,7 +15,7 @@ Selected GCC installation: /usr/bin/../lib/gcc/x86_64-linux-gnu/14
 Candidate multilib: .;@m64
 Selected multilib: .;@m64
 Compiler on Windows 11:
-> g++ -v
+$ g++ -v
 Using built-in specs.
 COLLECT_GCC=C:\w64devkit\bin\g++.exe
 COLLECT_LTO_WRAPPER=C:/w64devkit/bin/../libexec/gcc/x86_64-w64-mingw32/15.2.0/lto-wrapper.exe
