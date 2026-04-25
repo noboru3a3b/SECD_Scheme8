@@ -1,0 +1,27 @@
+;;
+;; Lexical変数が無限Extentを持つことの確認
+;;
+
+(define (make-variable-c)
+  (let ((c 0))
+    (list
+      (lambda () c)
+      (lambda () (set! c (+ c 1)))
+      (lambda () (set! c (- c 1)))
+)))
+
+(let* ((funcs (make-variable-c))
+       (get-c (car funcs))
+       (inc-c (cadr funcs))
+       (dec-c (caddr funcs)))
+  (print (get-c))
+  (inc-c)
+  (print (get-c))
+  (dec-c)
+  (dec-c)
+  (print (get-c))
+)
+;-> 0
+;   1
+;   -1
+
