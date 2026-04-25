@@ -33,7 +33,7 @@ Thread model: posix
 Supported LTO compression algorithms: zlib  
 gcc version 15.2.0 (GCC)  
 
-Installing the compiler on Windows 11 is done using w64devkit.  
+Installing the compiler on Windows 11 was done using w64devkit.  
 
 
 ## Example of building and running  
