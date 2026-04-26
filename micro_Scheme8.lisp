@@ -65,6 +65,7 @@
       (let ((val (get expr :gvar)))
         (and val (consp val) (eq 'macro (car val))))))
 
+
 ;; マクロのコードを取り出す
 (defun get-macro-code (expr)
   (caddr (get-gvar expr)))
@@ -181,12 +182,6 @@
              (t
               (setf (car *expr-save*) new-expr)
               (comp new-expr env code nil)))))
-        ((and (symbolp (car expr)) ; add primitive function call 2011-05-18 okada-n
-              (gboundp (car expr))
-              (eq (car (get-gvar (car expr))) 'primitive))
-         (complis (cdr expr)
-                  env
-                  (list* 'args (length (cdr expr)) (car expr) code))) ; for delete prim-tag  2012-05-14 okada-n
         (t				; 関数呼び出し
          (complis (cdr expr)
                   env
@@ -378,7 +373,7 @@
             (push sym s)))
          ((stop) (return (car s)))
          (t
-          (push (apply (cadr (get-gvar cmd)) (pop s)) s)) ; for delete prim-tag  2012-05-14 okada-n
+          (error "unknown opcode"))
          ))))
 
 ;; 大域変数
@@ -526,19 +521,21 @@
              (format t ">>"))
            (format t "> ")		; okada-n
            (force-output)
-           (let* ((expr0 (read)) ; change for macroexpand-all 2011-05-27 okada-n
-                  (expr (compile-expr expr0)))
-             (when *macro-print-flag* ; add for macroexpand-all 2011-05-27 okada-n
-               (format t "====================~%")
-               (format t "Expanded: ~S~%" expr0)
-               (format t "====================~%"))
-             (when *compile-print-flag*
-               (format t "Compile => ~S~%" expr))
-             (let ((*trace-flag* *trace-print-flag*)) ; add trace function okada-n
-               (setf output (vm '() '() expr '())))
-             (when *compile-print-flag*	; okada-n
-               (format t "Value => "))
-             (format t "~S~%" output))
+           (handler-case
+               (let* ((expr0 (read)) ; change for macroexpand-all 2011-05-27 okada-n
+                      (expr (compile-expr expr0)))
+                 (when *macro-print-flag* ; add for macroexpand-all 2011-05-27 okada-n
+                   (format t "====================~%")
+                   (format t "Expanded: ~S~%" expr0)
+                   (format t "====================~%"))
+                 (when *compile-print-flag*
+                   (format t "Compile => ~S~%" expr))
+                 (let ((*trace-flag* *trace-print-flag*)) ; add trace function okada-n
+                   (setf output (vm '() '() expr '())))
+                 (when *compile-print-flag*	; okada-n
+                   (format t "Value => "))
+                 (format t "~S~%" output))
+             (simple-error (c) (format t "ERROR: ~a~%" c)))
            ))
     (setq *readtable* (copy-readtable nil))))
 

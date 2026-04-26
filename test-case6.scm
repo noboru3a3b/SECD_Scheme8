@@ -100,12 +100,15 @@ BAZ-A
 (baz-a 'c)
 (A . C)
 
+((lambda (+) (+ 1 2)) (lambda (a b) 99))
+99
+
 baz
-(CLOSURE (LDF (LD (1 . 0) LD (0 . 0) ARGS 2 CONS RTN) RTN)
+(CLOSURE (LDF (LD (1 . 0) LD (0 . 0) ARGS 2 LDG CONS TAPP RTN) RTN)
          NIL)
 
 baz-a
-(CLOSURE (LD (1 . 0) LD (0 . 0) ARGS 2 CONS RTN) ((A)))
+(CLOSURE (LD (1 . 0) LD (0 . 0) ARGS 2 LDG CONS TAPP RTN) ((A)))
 
 
 ;; test1-5
@@ -348,7 +351,7 @@ A
 (A B C D)
 
 a
-(CONTINUATION (B A) NIL (LDC D ARGS 4 LIST STOP) NIL)
+(CONTINUATION (B A) NIL (LDC D ARGS 4 LDG LIST APP STOP) NIL)
 
 (a 'e)
 (A B E D)
@@ -539,15 +542,15 @@ A
 
 a
 (CLOSURE
-         (LD (1 . 0) ARGS 1 NOT SEL
+         (LD (1 . 0) ARGS 1 LDG NOT APP SEL
           (ARGS 0 LD (2 . 0) APP ARGS 1 LDF
-           (LD (2 . 0) ARGS 1 NOT SELR
+           (LD (2 . 0) ARGS 1 LDG NOT APP SELR
             (ARGS 0 LDF
              (LDG TRUE LSET (3 . 0) POP LD (1 . 0) LSET (3 . 1) RTN) APP RTN)
             (LDC :UNDEF RTN))
            APP JOIN)
           (LDC :UNDEF JOIN) POP LD (1 . 1) RTN)
-         ((FALSE FALSE) ((CLOSURE (LDC 10 LDC 20 ARGS 2 + RTN) NIL))))
+         ((FALSE FALSE) ((CLOSURE (LDC 10 LDC 20 ARGS 2 LDG + TAPP RTN) NIL))))
 
 (force a)
 30
@@ -557,9 +560,9 @@ B
 
 b
 (CLOSURE
-         (LD (1 . 0) ARGS 1 NOT SEL
+         (LD (1 . 0) ARGS 1 LDG NOT APP SEL
           (ARGS 0 LD (2 . 0) APP ARGS 1 LDF
-           (LD (2 . 0) ARGS 1 NOT SELR
+           (LD (2 . 0) ARGS 1 LDG NOT APP SELR
             (ARGS 0 LDF
              (LDG TRUE LSET (3 . 0) POP LD (1 . 0) LSET (3 . 1) RTN) APP RTN)
             (LDC :UNDEF RTN))
@@ -568,8 +571,8 @@ b
          ((FALSE FALSE)
           ((CLOSURE
             (ARGS 0 LDF
-             (LDC "oops! " ARGS 1 DISPLAY POP LDC 10 LDC 20 ARGS 2
-              + RTN)
+             (LDC "oops! " ARGS 1 LDG DISPLAY APP POP LDC 10 LDC 20 ARGS 2
+              LDG + TAPP RTN)
              APP RTN)
             NIL))))
 
