@@ -172,9 +172,17 @@ int g_vm_subset_failure_count = 0;
 bool g_trace_letrec = false;
 int g_trace_vm_session = 0;
 long long g_do_loop_counter = 0;
-const size_t MAX_OBJECTS = 10000;   // この件数を超えたら GC を発動
+const size_t MAX_OBJECTS = 100000;  // この件数を超えたら GC を発動
+const size_t MAX_VM_STEPS = 100000000; // VM 実行ステップ上限
+const size_t GC_WARN_HEAP_HIGH_PERCENT = 95;   // GC 後 heap が上限の 95% 以上
+const size_t GC_WARN_LOW_COLLECT_PERCENT = 1;  // 回収率 1% 以下を低回収とみなす
+const size_t GC_WARN_PRESSURE_STREAK = 8;      // 低回収 + 高水位 が連続したら警告
+const size_t GC_WARN_LEXENV_STREAK = 4;        // lexenv 増加が連続したら警告
 const int SMALL_INT_MIN = -1024;   // 整数キャッシュの下限
 const int SMALL_INT_MAX = 4096;    // 整数キャッシュの上限
+
+size_t g_gc_pressure_streak = 0;
+size_t g_gc_lexenv_growth_streak = 0;
 
 VMContext* g_active_ctx = nullptr;             // alloc 時に参照する実行コンテキスト
 std::vector<Object*>* g_active_constants = nullptr; // alloc 時に参照する定数プール
@@ -370,7 +378,7 @@ void mark(Object* obj) {
     }
 }
 
-void sweep(bool silent = false) {
+size_t sweep() {
     auto it = std::remove_if(heap.begin(), heap.end(), [](Object* obj) {
         if (obj->marked) {
             obj->marked = false;
@@ -381,10 +389,14 @@ void sweep(bool silent = false) {
     });
     
     size_t collected = std::distance(it, heap.end());
-    if (!silent && collected > 0) {
-        std::cout << "[GC] Collected " << collected << " objects." << std::endl;
+    if (collected > 0) {
+        std::cout << "[GC] Collected " << collected << " objects."
+                  << "  heap=" << (heap.size() - collected)
+                  << "  lexenv=" << g_closure_lexenv.size()
+                  << std::endl;
     }
     heap.erase(it, heap.end());
+    return collected;
 }
 
 void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
@@ -400,11 +412,6 @@ void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
     for (auto& frame : g_eval_env_stack) {
         for (auto& kv : frame) mark(kv.second);
     }
-    for (auto& closure_env : g_closure_lexenv) {
-        for (auto& frame : closure_env.second) {
-            for (auto& kv : frame) mark(kv.second);
-        }
-    }
     for (auto& frame : ctx.d) {
         for (auto& s_item : frame.s) mark(s_item);
         for (auto& e_frame : frame.e) {
@@ -412,7 +419,57 @@ void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
         }
     }
 
-    sweep(silent);
+    // Prune dead closure keys before tracing captured lexical environments.
+    size_t lexenv_before = g_closure_lexenv.size();
+    for (auto it = g_closure_lexenv.begin(); it != g_closure_lexenv.end(); ) {
+        Object* clo = it->first;
+        if (!clo || clo->type != CLOSURE || !clo->marked) {
+            it = g_closure_lexenv.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    size_t lexenv_after = g_closure_lexenv.size();
+
+    for (auto& closure_env : g_closure_lexenv) {
+        for (auto& frame : closure_env.second) {
+            for (auto& kv : frame) mark(kv.second);
+        }
+    }
+
+    size_t collected = sweep();
+    size_t heap_after = heap.size();
+    size_t heap_before = heap_after + collected;
+
+    if (lexenv_after > lexenv_before) {
+        g_gc_lexenv_growth_streak++;
+    } else {
+        g_gc_lexenv_growth_streak = 0;
+    }
+
+    bool heap_high = (heap_after * 100 >= MAX_OBJECTS * GC_WARN_HEAP_HIGH_PERCENT);
+    bool low_collection = (heap_before > 0) && (collected * 100 <= heap_before * GC_WARN_LOW_COLLECT_PERCENT);
+    if (heap_high && low_collection) {
+        g_gc_pressure_streak++;
+    } else {
+        g_gc_pressure_streak = 0;
+    }
+
+    if (!silent && g_gc_lexenv_growth_streak >= GC_WARN_LEXENV_STREAK) {
+        std::cout << "[GC-WARN] lexenv growth streak=" << g_gc_lexenv_growth_streak
+                  << "  lexenv=" << lexenv_before << "->" << lexenv_after
+                  << "  collected=" << collected
+                  << "  heap=" << heap_after << "/" << MAX_OBJECTS
+                  << std::endl;
+    }
+
+    if (!silent && g_gc_pressure_streak >= GC_WARN_PRESSURE_STREAK) {
+        std::cout << "[GC-WARN] high heap pressure streak=" << g_gc_pressure_streak
+                  << "  collected=" << collected << "/" << heap_before
+                  << "  heap=" << heap_after << "/" << MAX_OBJECTS
+                  << "  lexenv=" << lexenv_after
+                  << std::endl;
+    }
 }
 
 Object* alloc(Type t) {
@@ -2131,7 +2188,6 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
         ~CtxGuard() { *slot_ctx = saved_ctx; *slot_con = saved_con; }
     } ctx_guard{&g_active_ctx, prev_ctx, &g_active_constants, prev_constants};
 
-    constexpr size_t MAX_STEPS = 1000000;  // Prevent infinite loops
     constexpr size_t MAX_ENV_DEPTH = 10000;
     constexpr size_t MAX_STACK_SIZE = 100000;
     size_t step_count = 0;
@@ -2140,8 +2196,8 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
         size_t pc = 0;
 
         while (pc < ctx.c.size()) {
-            if (step_count++ > MAX_STEPS) {
-                std::cerr << "[vm] ERROR: Exceeded maximum instruction steps (" << MAX_STEPS << ")" << std::endl;
+            if (step_count++ > MAX_VM_STEPS) {
+                std::cerr << "[vm] ERROR: Exceeded maximum instruction steps (" << MAX_VM_STEPS << ")" << std::endl;
                 return nullptr;
             }
             if (ctx.e.size() > MAX_ENV_DEPTH) {
