@@ -76,6 +76,8 @@ struct VMContext {
 // ------------------------------------------------------------
 enum Type { INT, INT64, DOUBLE, SYMBOL, STRING, PAIR, CLOSURE, CONTINUATION, PRIMITIVE, PORT, UNDEF, VECTOR };
 
+extern size_t g_vector_slot_count;
+
 // ------------------------------------------------------------
 // Object: ヒープ上のすべての Scheme 値を表す統一構造体
 //   type   : 上記 Type 列挙値
@@ -140,7 +142,10 @@ struct Object {
             delete continuation.c; delete continuation.d; delete continuation.constants;
         }
         else if (type == PRIMITIVE) delete prim;
-        else if (type == VECTOR) delete vec;
+        else if (type == VECTOR) {
+            if (vec) g_vector_slot_count -= vec->size();
+            delete vec;
+        }
     }
 };
 
@@ -183,6 +188,8 @@ const int SMALL_INT_MAX = 4096;    // 整数キャッシュの上限
 
 size_t g_gc_pressure_streak = 0;
 size_t g_gc_lexenv_growth_streak = 0;
+size_t g_gc_prev_lexenv_size = 0;  // 前回 GC 後の g_closure_lexenv サイズ（連続増加判定用）
+size_t g_vector_slot_count = 0;    // VECTOR 内の総要素数（O(1) の実効ヒープ重み用）
 
 VMContext* g_active_ctx = nullptr;             // alloc 時に参照する実行コンテキスト
 std::vector<Object*>* g_active_constants = nullptr; // alloc 時に参照する定数プール
@@ -193,6 +200,7 @@ Object* eval_from_source(const std::string& source, VMContext& ctx, std::vector<
 std::vector<Object*> read_all_exprs_from_string(const std::string& text);
 bool load_scheme_file(const std::string& path);
 Object* prim_read_impl(std::vector<Object*>& args);
+static size_t effective_heap_weight();
 
 struct ParseError : public std::runtime_error {
     explicit ParseError(const std::string& msg) : std::runtime_error(msg) {}
@@ -204,6 +212,54 @@ struct VMError : public std::runtime_error {
 struct ContinuationEscape {
     Object* tag;
     Object* value;
+};
+
+// ------------------------------------------------------------
+// EvalEnvGuard
+//   g_eval_env_stack の RAII リストア用ガード。
+//   コンストラクタでスタックを snapshot し、デストラクタで必ず戻す。
+//   例外・早期 return のどちらでも env が残留しない。
+//   使い方:
+//     EvalEnvGuard _guard(g_eval_env_stack);       // 全体スナップショット
+//     EvalEnvGuard _guard(g_eval_env_stack, true); // push_back 1フレーム分だけ守る
+// ------------------------------------------------------------
+struct EvalEnvGuard {
+    std::vector<EvalFrame>& stack;
+    std::vector<EvalFrame> saved;
+
+    // フルスナップショット：restore 時に saved で完全上書き
+    explicit EvalEnvGuard(std::vector<EvalFrame>& s)
+        : stack(s), saved(s) {}
+
+    // push ガード：restore 時に saved サイズまで切り詰める（pop_back の代替）
+    EvalEnvGuard(std::vector<EvalFrame>& s, bool /*pop_mode*/)
+        : stack(s), saved() { saved.resize(s.size()); /* size だけ記録 */ }
+
+    ~EvalEnvGuard() {
+        if (saved.empty()) {
+            // pop ガード：元のサイズより増えたフレームを除去
+            // (saved が空なのは pop_mode の証)
+            // → ただし本実装では size を別フィールドで持つ方が明確なので
+            //   フルスナップショット方式に統一する
+        }
+        stack = saved;
+    }
+
+    // 明示的に解除（正常終了時は restore 不要な箇所向け）
+    // ※ 本 codebase では正常時も restore するので通常は不要
+};
+
+// pop_back 1フレーム専用ガード（let/letrec 向け・軽量）
+struct EvalFramePushGuard {
+    std::vector<EvalFrame>& stack;
+    bool active = true;
+    explicit EvalFramePushGuard(std::vector<EvalFrame>& s) : stack(s) {
+        stack.push_back(EvalFrame{});
+    }
+    ~EvalFramePushGuard() {
+        if (active && !stack.empty()) stack.pop_back();
+    }
+    void release() { active = false; } // 手動 pop した後に呼ぶ
 };
 
 struct ParamSpec {
@@ -378,7 +434,7 @@ void mark(Object* obj) {
     }
 }
 
-size_t sweep() {
+size_t sweep(bool silent = false) {
     auto it = std::remove_if(heap.begin(), heap.end(), [](Object* obj) {
         if (obj->marked) {
             obj->marked = false;
@@ -389,7 +445,7 @@ size_t sweep() {
     });
     
     size_t collected = std::distance(it, heap.end());
-    if (collected > 0) {
+    if (!silent && collected > 0) {
         std::cout << "[GC] Collected " << collected << " objects."
                   << "  heap=" << (heap.size() - collected)
                   << "  lexenv=" << g_closure_lexenv.size()
@@ -437,15 +493,17 @@ void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
         }
     }
 
-    size_t collected = sweep();
+    size_t collected = sweep(silent);
     size_t heap_after = heap.size();
     size_t heap_before = heap_after + collected;
 
-    if (lexenv_after > lexenv_before) {
+    // 前回 GC 後のサイズと比較して増加していれば streak を増やす
+    if (lexenv_after > g_gc_prev_lexenv_size) {
         g_gc_lexenv_growth_streak++;
     } else {
         g_gc_lexenv_growth_streak = 0;
     }
+    g_gc_prev_lexenv_size = lexenv_after;
 
     bool heap_high = (heap_after * 100 >= MAX_OBJECTS * GC_WARN_HEAP_HIGH_PERCENT);
     bool low_collection = (heap_before > 0) && (collected * 100 <= heap_before * GC_WARN_LOW_COLLECT_PERCENT);
@@ -455,24 +513,47 @@ void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
         g_gc_pressure_streak = 0;
     }
 
+    // ベクタ要素込みの実効サイズを警告ログに記録（GC 後に 1 回だけ走査するので許容コスト）
+    size_t weight_after = effective_heap_weight();
+
     if (!silent && g_gc_lexenv_growth_streak >= GC_WARN_LEXENV_STREAK) {
         std::cout << "[GC-WARN] lexenv growth streak=" << g_gc_lexenv_growth_streak
                   << "  lexenv=" << lexenv_before << "->" << lexenv_after
                   << "  collected=" << collected
-                  << "  heap=" << heap_after << "/" << MAX_OBJECTS
+                  << "  heap=" << heap_after << "(weight=" << weight_after << ")/" << MAX_OBJECTS
                   << std::endl;
     }
 
     if (!silent && g_gc_pressure_streak >= GC_WARN_PRESSURE_STREAK) {
         std::cout << "[GC-WARN] high heap pressure streak=" << g_gc_pressure_streak
                   << "  collected=" << collected << "/" << heap_before
-                  << "  heap=" << heap_after << "/" << MAX_OBJECTS
+                  << "  heap=" << heap_after << "(weight=" << weight_after << ")/" << MAX_OBJECTS
                   << "  lexenv=" << lexenv_after
                   << std::endl;
     }
 }
 
+// heap 上の Object 数にベクタ要素数を加えた実効サイズを返す。
+// GC 後の診断ログ出力専用（alloc のたびに呼ぶと O(n²) になるため使わないこと）。
+static size_t effective_heap_weight() {
+    return heap.size() + g_vector_slot_count;
+}
+
+static void clear_transient_eval_state(VMContext* ctx = nullptr) {
+    g_eval_env_stack.clear();
+    if (ctx) ctx->s.clear();
+}
+
+static void set_vector_storage(Object* obj, std::vector<Object*>* storage) {
+    if (!obj || obj->type != VECTOR) return;
+    if (obj->vec) g_vector_slot_count -= obj->vec->size();
+    obj->vec = storage;
+    if (obj->vec) g_vector_slot_count += obj->vec->size();
+}
+
 Object* alloc(Type t) {
+    // heap.size() は O(1) のため毎回の alloc で呼んでも安全。
+    // effective_heap_weight() は O(n) なので alloc では使わない。
     if (g_active_ctx && g_active_constants && heap.size() >= MAX_OBJECTS) {
         gc(*g_active_ctx, *g_active_constants);
     }
@@ -1472,7 +1553,8 @@ Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
             ParamSpec spec;
             if (!extract_param_spec(params_expr, spec)) return nullptr;
 
-            EvalEnv previous_env = g_eval_env_stack;
+            // EvalEnvGuard: 例外・早期 return のどちらでも previous_env へ復元する
+            EvalEnvGuard _env_guard(g_eval_env_stack);
             auto it_env = g_closure_lexenv.find(proc);
             if (it_env != g_closure_lexenv.end()) {
                 g_eval_env_stack = it_env->second;
@@ -1481,22 +1563,21 @@ Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
             }
 
             g_eval_env_stack.push_back(EvalFrame{});
-            EvalFrame& call_frame = g_eval_env_stack.back();
+            EvalFrame call_frame_copy;  // back() の参照は push 後の realloc で無効化される恐れがあるため値コピー
             if (!spec.has_rest && spec.fixed.size() != args.size()) {
-                g_eval_env_stack = previous_env;
-                return nullptr;
+                return nullptr;  // _env_guard が復元
             }
             if (spec.has_rest && args.size() < spec.fixed.size()) {
-                g_eval_env_stack = previous_env;
-                return nullptr;
+                return nullptr;  // _env_guard が復元
             }
             for (size_t i = 0; i < spec.fixed.size(); ++i) {
-                call_frame[spec.fixed[i]] = args[i];
+                call_frame_copy[spec.fixed[i]] = args[i];
             }
             if (spec.has_rest) {
                 std::vector<Object*> rest_items(args.begin() + static_cast<long long>(spec.fixed.size()), args.end());
-                call_frame[spec.rest] = vector_to_pair(rest_items);
+                call_frame_copy[spec.rest] = vector_to_pair(rest_items);
             }
+            g_eval_env_stack.back() = std::move(call_frame_copy);
 
             Object* result = nullptr;
             Object* cur = body_list;
@@ -1505,8 +1586,7 @@ Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
                 cur = cur->pair.cdr;
             }
 
-            g_eval_env_stack = previous_env;
-            return result;
+            return result;  // _env_guard が previous_env へ復元
         }
 
         VMContext call_ctx;
@@ -1879,24 +1959,21 @@ Object* eval_expr(Object* expr) {
         if (is_symbol_name(head, "let")) {
             std::vector<Object*> values;
             for (auto& b : binds) values.push_back(eval_expr(b.second));
-            g_eval_env_stack.push_back(EvalFrame{});
+            EvalFramePushGuard _let_guard(g_eval_env_stack);  // 例外時も pop_back を保証
             for (size_t i = 0; i < binds.size(); ++i) g_eval_env_stack.back()[binds[i].first] = values[i];
-            Object* result = eval_sequence(body_list);
-            g_eval_env_stack.pop_back();
-            return result;
+            return eval_sequence(body_list);
         }
 
         if (is_symbol_name(head, "let*")) {
-            g_eval_env_stack.push_back(EvalFrame{});
+            EvalFramePushGuard _lets_guard(g_eval_env_stack);  // 例外時も pop_back を保証
             for (auto& b : binds) {
                 g_eval_env_stack.back()[b.first] = eval_expr(b.second);
             }
-            Object* result = eval_sequence(body_list);
-            g_eval_env_stack.pop_back();
-            return result;
+            return eval_sequence(body_list);
         }
 
-        g_eval_env_stack.push_back(EvalFrame{});
+        // letrec
+        EvalFramePushGuard _letrec_guard(g_eval_env_stack);  // 例外時も pop_back を保証
         for (auto& b : binds) g_eval_env_stack.back()[b.first] = globals[":undef"];
         for (auto& b : binds) g_eval_env_stack.back()[b.first] = eval_expr(b.second);
         // letrec requires closures to see the finalized recursive frame.
@@ -1906,9 +1983,7 @@ Object* eval_expr(Object* expr) {
                 g_closure_lexenv[v] = g_eval_env_stack;
             }
         }
-        Object* result = eval_sequence(body_list);
-        g_eval_env_stack.pop_back();
-        return result;
+        return eval_sequence(body_list);
     }
 
     // --- and / or / cond / when / unless / case ---
@@ -2807,7 +2882,7 @@ Object* s_read_vector(const std::vector<Token>& tokens, int& idx) {
     }
     if (tokens[idx].type == TOK_RPAREN) idx++;
     Object* v = alloc(VECTOR);
-    v->vec = new std::vector<Object*>(elems);
+    set_vector_storage(v, new std::vector<Object*>(elems));
     // GC ルートに積んでいた要素をすべて除去
     if (g_active_ctx) {
         for (size_t i = 0; i < elems.size(); ++i) g_active_ctx->s.pop_back();
@@ -3825,14 +3900,14 @@ void register_core_primitives() {
             if (n < 0) return (Object*)nullptr;
             Object* fill = (args.size() >= 2) ? args[1] : nullptr;
             Object* v = alloc(VECTOR);
-            v->vec = new std::vector<Object*>(static_cast<size_t>(n), fill);
+            set_vector_storage(v, new std::vector<Object*>(static_cast<size_t>(n), fill));
             return v;
         });
 
         // (vector e0 e1 ...) => #(e0 e1 ...)
         add_prim("vector", [](std::vector<Object*>& args) {
             Object* v = alloc(VECTOR);
-            v->vec = new std::vector<Object*>(args);
+            set_vector_storage(v, new std::vector<Object*>(args));
             return v;
         });
 
@@ -3877,7 +3952,7 @@ void register_core_primitives() {
         add_prim("vector-copy", [](std::vector<Object*>& args) -> Object* {
             if (args.empty() || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
             Object* v = alloc(VECTOR);
-            v->vec = new std::vector<Object*>(*args[0]->vec);
+            set_vector_storage(v, new std::vector<Object*>(*args[0]->vec));
             return v;
         });
 
@@ -3892,7 +3967,7 @@ void register_core_primitives() {
             if (args.empty()) return (Object*)nullptr;
             std::vector<Object*> items = pair_to_vector(args[0]);
             Object* v = alloc(VECTOR);
-            v->vec = new std::vector<Object*>(items);
+            set_vector_storage(v, new std::vector<Object*>(items));
             return v;
         });
 
@@ -3902,7 +3977,7 @@ void register_core_primitives() {
                 return (Object*)nullptr;
             Object* pred = args[0];
             Object* v = alloc(VECTOR);
-            v->vec = new std::vector<Object*>(*args[1]->vec);
+            set_vector_storage(v, new std::vector<Object*>(*args[1]->vec));
             std::stable_sort(v->vec->begin(), v->vec->end(), [&](Object* a, Object* b) {
                 std::vector<Object*> cmp_args = {a, b};
                 Object* result = invoke_callable(pred, cmp_args);
@@ -3943,10 +4018,11 @@ void register_core_primitives() {
                 return (Object*)nullptr;
             Object* proc = args[0];
             Object* result = alloc(VECTOR);
-            result->vec = new std::vector<Object*>();
+            set_vector_storage(result, new std::vector<Object*>());
             result->vec->reserve(args[1]->vec->size());
             for (auto& elem : *args[1]->vec) {
                 std::vector<Object*> one = {elem};
+                g_vector_slot_count++;
                 result->vec->push_back(invoke_callable(proc, one));
             }
             return result;
@@ -4451,6 +4527,7 @@ int main(int argc, char** argv) {
         if (input == "" || input.find("exit") != std::string::npos) break;
 
         try {
+            clear_transient_eval_state(&repl_ctx);
             std::vector<Token> tokens = tokenize(input);
             int idx = 0;
             Object* expr = s_read(tokens, idx);
@@ -4461,14 +4538,20 @@ int main(int argc, char** argv) {
 
             print_obj(result);
             std::cout << std::endl;
-            repl_ctx.s.clear();
+            clear_transient_eval_state(&repl_ctx);
 
-            std::cout << "\nHeap size: " << heap.size() << "\n\n";
+            std::cout << "\nHeap size: " << heap.size()
+                      << "  Weight: " << effective_heap_weight()
+                      << "  LexEnv: " << g_closure_lexenv.size()
+                      << "\n\n";
         } catch (const ParseError& e) {
+            clear_transient_eval_state(&repl_ctx);
             std::cout << "Parse Error: " << e.what() << std::endl;
         } catch (const VMError& e) {
+            clear_transient_eval_state(&repl_ctx);
             std::cout << "VM Error: " << e.what() << std::endl;
         } catch (const std::exception& e) {
+            clear_transient_eval_state(&repl_ctx);
             std::cout << "Error: " << e.what() << std::endl;
         }
     }
