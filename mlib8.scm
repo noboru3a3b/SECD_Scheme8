@@ -1,12 +1,12 @@
 ;
-; mlib.scm : micro Scheme 用ライブラリ
+; mlib8.scm : micro Scheme support library
 ;
 ;            Copyright (C) 2009 Makoto Hiroi
 ;
 
-;;; リスト操作関数
+;;; Basic list helpers
 
-;; add  2013-11-13 okada-n
+;; add 2013-11-13 okada-n
 (define caaar (lambda (x) (car (car (car x)))))
 (define cdaar (lambda (x) (cdr (car (car x)))))
 (define cadar (lambda (x) (car (cdr (car x)))))
@@ -15,32 +15,29 @@
 (define cdadr (lambda (x) (cdr (car (cdr x)))))
 (define cdddr (lambda (x) (cdr (cdr (cdr x)))))
 
-;
 (define memv
   (lambda (x ls)
     (if (null? ls)
         false
         (if (eqv? x (car ls))
             ls
-          (memv x (cdr ls))))))
+            (memv x (cdr ls))))))
 
-;
 (define assv
   (lambda (x ls)
     (if (null? ls)
         false
-      (if (eqv? x (car (car ls)))
-          (car ls)
-        (assv x (cdr ls))))))
+        (if (eqv? x (car (car ls)))
+            (car ls)
+            (assv x (cdr ls))))))
 
-;;; 高階関数
+;;; Iterator helpers
 
-;
 (define map-2
   (lambda (fn xs ys)
     (if (null? xs)
         '()
-      (cons (fn (car xs) (car ys)) (map-2 fn (cdr xs) (cdr ys))))))
+        (cons (fn (car xs) (car ys)) (map-2 fn (cdr xs) (cdr ys))))))
 
 ;;; mlib8 for micro_scheme10.cpp
 ;
@@ -50,40 +47,37 @@
 ;   Redefining them here as macros can change evaluation route and break
 ;   VM behavior parity. So mlib8 intentionally does NOT redefine them.
 
-;;; マクロを使った関数の定義
+;;; Macro utility functions
 
-; イテレータを生成する関数
 (define make-iter
- (lambda (proc . args)
-  (letrec ((iter
-            (lambda (return)
-              (apply 
-                proc
-                (lambda (x)             ; 高階関数に渡す関数の本体
-                  (set! return          ; 脱出先継続の書き換え
-                   (call/cc
-                    (lambda (cont)
-                      (set! iter cont)  ; 継続の書き換え
-                      (return x)))))
-                args)
-                ; 終了後は継続 return で脱出
+  (lambda (proc . args)
+    (letrec ((iter
+              (lambda (return)
+                (apply
+                  proc
+                  (lambda (x)
+                    (set! return
+                      (call/cc
+                        (lambda (cont)
+                          (set! iter cont)
+                          (return x)))))
+                  args)
                 (return false))))
-    (lambda ()
-      (call/cc
-        (lambda (cont) (iter cont)))))))
+      (lambda ()
+        (call/cc
+          (lambda (cont) (iter cont)))))))
 
-; 木の高階関数
 (define for-each-tree
- (lambda (fn ls)
-  (let loop ((ls ls))
-    (cond ((null? ls) '())
-          ((pair? ls)
-           (loop (car ls))
-           (loop (cdr ls)))
-          (else (fn ls))))))
+  (lambda (fn ls)
+    (let loop ((ls ls))
+      (cond ((null? ls) '())
+            ((pair? ls)
+             (loop (car ls))
+             (loop (cdr ls)))
+            (else (fn ls))))))
 
-; delay と force
-(define-macro delay 
+;; delay and force
+(define-macro delay
   (lambda (expr)
     `(make-promise (lambda () ,expr))))
 
@@ -98,7 +92,7 @@
                          (set! result x)))))
         result))))
 
-(define force 
+(define force
   (lambda (promise) (promise)))
 
 ;; fact
@@ -107,22 +101,22 @@
   (lambda (n a)
     (if (= n 0)
         a
-      (fact (- n 1) (* a n)))))
+        (fact (- n 1) (* a n)))))
 
-;; tarai と tak
+;; tarai and tak
 ;; usage: (tarai 10 5 0)
 ;;        (tak 14 7 0)
 (define tarai
   (lambda (x y z)
     (if (<= x y)
         y
-      (tarai (tarai (- x 1) y z) (tarai (- y 1) z x) (tarai (- z 1) x y)))))
+        (tarai (tarai (- x 1) y z) (tarai (- y 1) z x) (tarai (- z 1) x y)))))
 
 (define tak
   (lambda (x y z)
     (if (<= x y)
         z
-      (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y)))))
+        (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y)))))
 
 ;; tarai (delay)
 ;; usage: (tarai-delay 80 40 (delay 0))
@@ -130,96 +124,97 @@
   (lambda (x y z)
     (if (<= x y)
         y
-      (let ((zz (force z)))
-        (tarai-delay (tarai-delay (- x 1) y (delay zz))
-                     (tarai-delay (- y 1) zz (delay x))
-                     (delay (tarai-delay (- zz 1) x (delay y))))))))
+        (let ((zz (force z)))
+          (tarai-delay (tarai-delay (- x 1) y (delay zz))
+                       (tarai-delay (- y 1) zz (delay x))
+                       (delay (tarai-delay (- zz 1) x (delay y))))))))
 
-;;; queue & primes ;;;
+;;; queue and primes
 
-;; queue
-(define make-queue (lambda (x)
-  (let ((seed (cons x '())))
-    (cons seed seed))))
+(define make-queue
+  (lambda (x)
+    (let ((seed (cons x '())))
+      (cons seed seed))))
 
-(define en-queue! (lambda (queue x)
-  (let ((q (cons x '())))
-    (set-cdr! (cdr queue) q)
-    (set-cdr! queue q)
-    queue)))
+(define en-queue!
+  (lambda (queue x)
+    (let ((q (cons x '())))
+      (set-cdr! (cdr queue) q)
+      (set-cdr! queue q)
+      queue)))
 
-(define de-queue! (lambda (queue)
-  (let* ((head (car queue))
-         (lst (cdar queue))
-         (val (car lst))
-         (rest (cdr lst)))
-    (set-cdr! head rest)
-    (if (null? rest) (set-cdr! queue head))
-    val)))
+(define de-queue!
+  (lambda (queue)
+    (let* ((head (car queue))
+           (lst (cdar queue))
+           (val (car lst))
+           (rest (cdr lst)))
+      (set-cdr! head rest)
+      (if (null? rest) (set-cdr! queue head))
+      val)))
 
 (define get-queue-lst (lambda (queue) (cdar queue)))
-
 (define get-all-lst (lambda (queue) (car queue)))
 
-;; primes
-(define primes (lambda (queue x xmax)
-  (cond ((> x xmax)
-	  (get-all-lst queue))
-	((is-prime (get-queue-lst queue) x)
-	  (primes (en-queue! queue x) (+ x 2) xmax))
-	(else
-	  (primes queue (+ x 2) xmax)))))
+(define primes
+  (lambda (queue x xmax)
+    (cond ((> x xmax)
+           (get-all-lst queue))
+          ((is-prime (get-queue-lst queue) x)
+           (primes (en-queue! queue x) (+ x 2) xmax))
+          (else
+           (primes queue (+ x 2) xmax)))))
 
-(define is-prime (lambda (p-lst x)
-  (if (null? p-lst)
-      true
-      (let ((p (car p-lst)))
-	(cond ((> (* p p) x)
-	              true)
-	            ((= 0 (modulo x p))
-		            false)
-		          (else
-			          (is-prime (cdr p-lst) x)))))))
+(define is-prime
+  (lambda (p-lst x)
+    (if (null? p-lst)
+        true
+        (let ((p (car p-lst)))
+          (cond ((> (* p p) x)
+                 true)
+                ((= 0 (modulo x p))
+                 false)
+                (else
+                 (is-prime (cdr p-lst) x)))))))
 
-;;; file i/o ;;;
+;;; file i/o
 
-;; cr-conv
-(define cr-conv (lambda (from to)
-  (let ((pfr (open-input-file from))
-        (pto (open-output-file to)))
-    (let loop ((line (read-line pfr)))
-      (if (eof-object? line)
-          (begin
-            (close-input-port pfr)
-            (close-output-port pto))
-          (begin
-            (write line pto)
-            (write_newline pto)
-            (loop (read-line pfr))))))))
+(define cr-conv
+  (lambda (from to)
+    (let ((pfr (open-input-file from))
+          (pto (open-output-file to)))
+      (let loop ((line (read-line pfr)))
+        (if (eof-object? line)
+            (begin
+              (close-input-port pfr)
+              (close-output-port pto))
+            (begin
+              (write line pto)
+              (write_newline pto)
+              (loop (read-line pfr))))))))
 
-;; cr-cut
-(define cr-cut (lambda (from to)
-  (let ((pfr (open-input-file from))
-        (pto (open-output-file to)))
-    (let loop ((line (read-line pfr)))
-      (if (eof-object? line)
-          (begin
-            (close-input-port pfr)
-            (close-output-port pto))
-          (begin
-            (write line pto)
-            (loop (read-line pfr))))))))
+(define cr-cut
+  (lambda (from to)
+    (let ((pfr (open-input-file from))
+          (pto (open-output-file to)))
+      (let loop ((line (read-line pfr)))
+        (if (eof-object? line)
+            (begin
+              (close-input-port pfr)
+              (close-output-port pto))
+            (begin
+              (write line pto)
+              (loop (read-line pfr))))))))
 
-;; copy-file
-(define copy-file (lambda (from to)
-  (let ((pfr (open-input-file from))
-        (pto (open-output-file to)))
-    (let loop((c (read-char pfr)))
-      (if (eof-object? c)
-          (begin
-            (close-input-port pfr)
-            (close-output-port pto))
-          (begin
-            (write-char c pto)
-            (loop (read-char pfr))))))))
-
+(define copy-file
+  (lambda (from to)
+    (let ((pfr (open-input-file from))
+          (pto (open-output-file to)))
+      (let loop ((c (read-char pfr)))
+        (if (eof-object? c)
+            (begin
+              (close-input-port pfr)
+              (close-output-port pto))
+            (begin
+              (write-char c pto)
+              (loop (read-char pfr))))))))

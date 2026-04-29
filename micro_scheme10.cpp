@@ -175,6 +175,7 @@ std::unordered_map<Object*, EvalEnv> g_closure_lexenv;
 int g_vm_subset_success_count = 0;
 int g_vm_subset_failure_count = 0;
 bool g_trace_letrec = false;
+bool g_disable_vm_fast_path = false;
 int g_trace_vm_session = 0;
 long long g_do_loop_counter = 0;
 const size_t MAX_OBJECTS = 100000;  // この件数を超えたら GC を発動
@@ -201,6 +202,9 @@ std::vector<Object*> read_all_exprs_from_string(const std::string& text);
 bool load_scheme_file(const std::string& path);
 Object* prim_read_impl(std::vector<Object*>& args);
 static size_t effective_heap_weight();
+Object* macro_expand_1(Object* expr);
+Object* macro_expand(Object* expr);
+static bool contains_macro_call(Object* expr);
 
 struct ParseError : public std::runtime_error {
     explicit ParseError(const std::string& msg) : std::runtime_error(msg) {}
@@ -714,37 +718,40 @@ void print_obj_stream(Object* obj, std::ostream& os) {
             break;
         case CLOSURE: {
             os << "(CLOSURE ";
-            if (obj->closure.code) {
+            if (obj->closure.code && !obj->closure.code->empty()) {
+                // VM bytecode closure
                 print_code_stream(*obj->closure.code, os, obj->closure.constants);
+            } else if (obj->closure.constants && obj->closure.constants->size() >= 2) {
+                // Eval-closure: print (ARGS params body...) format - simplified to avoid traversal issues
+                os << "(ARGS ";
+                if ((*obj->closure.constants)[0]) {
+                    print_obj_stream((*obj->closure.constants)[0], os);
+                } else {
+                    os << "()";
+                }
+                os << " ...)";
             } else {
                 os << "()";
             }
-            os << " ";
-            if (obj->closure.env && !obj->closure.env->empty()) {
-                os << "(";
-                bool first = true;
-                for (const auto& frame : *obj->closure.env) {
-                    if (!first) os << " ";
-                    os << "(";
-                    bool first_var = true;
-                    for (const auto& var : frame) {
-                        if (!first_var) os << " ";
-                        print_obj_stream(var, os);
-                        first_var = false;
-                    }
-                    os << ")";
-                    first = false;
-                }
-                os << ")";
-            } else {
-                os << "NIL";
-            }
-            os << ")";
+            os << " NIL)";  // Simplified: always show NIL for environment to avoid traversal
             break;
         }
-        case PRIMITIVE:
-            os << "#<primitive>";
+        case PRIMITIVE: {
+            // Try to find the name of the primitive by searching globals
+            std::string prim_name;
+            for (const auto& kv : globals) {
+                if (kv.second == obj) {
+                    prim_name = kv.first;
+                    break;
+                }
+            }
+            if (prim_name.empty()) {
+                os << "(PRIMITIVE #<FUNCTION>)";
+            } else {
+                os << "(PRIMITIVE #<FUNCTION " << prim_name << ">)";
+            }
             break;
+        }
         case CONTINUATION:
             os << "#<continuation>";
             break;
@@ -1509,6 +1516,23 @@ bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
     std::vector<int> code;
     std::vector<Object*> constants;
     CompileEnv env;
+    std::vector<std::vector<Object*>> vm_lex_env;
+
+    // Bridge evaluator lexical frames into VM compile/runtime environments.
+    // g_eval_env_stack keeps outer->inner order, while VM expects frame 0 to be current.
+    for (auto it = g_eval_env_stack.rbegin(); it != g_eval_env_stack.rend(); ++it) {
+        std::vector<std::string> name_frame;
+        std::vector<Object*> value_frame;
+        name_frame.reserve(it->size());
+        value_frame.reserve(it->size());
+        for (const auto& kv : *it) {
+            name_frame.push_back(kv.first);
+            value_frame.push_back(kv.second);
+        }
+        env.push_back(std::move(name_frame));
+        vm_lex_env.push_back(std::move(value_frame));
+    }
+
     if (!compile_subset_expr(expr, code, constants, env)) {
         g_vm_subset_failure_count++;
         if (trace_target) {
@@ -1529,6 +1553,7 @@ bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
 
     VMContext vm_ctx;
     vm_ctx.c = std::move(code);
+    vm_ctx.e = std::move(vm_lex_env);
 
     if (trace_target) g_trace_vm_session++;
     out_value = vm(vm_ctx, constants);
@@ -1539,6 +1564,41 @@ bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
 
     g_vm_subset_success_count++;
     return true;
+}
+
+Object* try_make_compiled_lambda(Object* params_expr, Object* body_list, const std::string* binding_name = nullptr, bool macro_binding = false) {
+    if (contains_macro_call(body_list)) return nullptr;
+
+    std::vector<Object*> lambda_items = {get_symbol("lambda"), params_expr};
+    Object* cur = body_list;
+    while (cur && cur->type == PAIR) {
+        lambda_items.push_back(cur->pair.car);
+        cur = cur->pair.cdr;
+    }
+    Object* lambda_expr = vector_to_pair(lambda_items);
+
+    std::unordered_map<std::string, Object*>& table = macro_binding ? macros : globals;
+    bool had_existing = false;
+    Object* saved = nullptr;
+    if (binding_name) {
+        auto it = table.find(*binding_name);
+        if (it != table.end()) {
+            had_existing = true;
+            saved = it->second;
+        }
+        table[*binding_name] = globals[":undef"];
+    }
+
+    Object* compiled = nullptr;
+    bool ok = try_eval_expr_via_vm(lambda_expr, compiled) && compiled && compiled->type == CLOSURE &&
+              compiled->closure.code && !compiled->closure.code->empty();
+
+    if (binding_name) {
+        if (had_existing) table[*binding_name] = saved;
+        else table.erase(*binding_name);
+    }
+
+    return ok ? compiled : nullptr;
 }
 
 Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
@@ -1621,12 +1681,29 @@ Object* macro_expand_1(Object* expr) {
 }
 
 Object* macro_expand(Object* expr) {
+    constexpr int kMacroExpandMaxSteps = 256;
     Object* current = expr;
-    while (true) {
+    for (int step = 0; step < kMacroExpandMaxSteps; ++step) {
         Object* expanded = macro_expand_1(current);
         if (expanded == current) return current;
         current = expanded;
     }
+    throw VMError("macro expansion limit exceeded");
+}
+
+Object* macro_expand_trace(Object* expr, int max_steps = 64) {
+    if (max_steps <= 0) max_steps = 1;
+    std::vector<Object*> steps;
+    steps.push_back(expr);
+
+    Object* current = expr;
+    for (int step = 0; step < max_steps; ++step) {
+        Object* expanded = macro_expand_1(current);
+        if (expanded == current) break;
+        steps.push_back(expanded);
+        current = expanded;
+    }
+    return vector_to_pair(steps);
 }
 
 Object* lookup_name(const std::string& name) {
@@ -1636,6 +1713,8 @@ Object* lookup_name(const std::string& name) {
     }
     auto git = globals.find(name);
     if (git != globals.end()) return git->second;
+    auto mit = macros.find(name);
+    if (mit != macros.end()) return mit->second;
     return nullptr;
 }
 
@@ -1796,6 +1875,38 @@ Object* eval_sequence(Object* body_list) {
     return result;
 }
 
+static bool contains_macro_call(Object* expr) {
+    if (!expr || expr->type != PAIR) return false;
+
+    Object* head = expr->pair.car;
+    if (head && head->type == SYMBOL && head->sym) {
+        auto it = macros.find(*head->sym);
+        if (it != macros.end() && it->second) return true;
+    }
+
+    return contains_macro_call(expr->pair.car) || contains_macro_call(expr->pair.cdr);
+}
+
+bool contains_lexical_set(Object* expr) {
+    if (!expr || expr->type != PAIR) return false;
+
+    Object* head = expr->pair.car;
+    if (is_symbol_name(head, "quote") || is_symbol_name(head, "backquote")) {
+        return false;
+    }
+
+    if (is_symbol_name(head, "set!")) {
+        Object* rest = expr->pair.cdr;
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        if (name_obj && name_obj->type == SYMBOL && name_obj->sym) {
+            Object* tmp = nullptr;
+            if (lookup_lexical_now(*name_obj->sym, tmp)) return true;
+        }
+    }
+
+    return contains_lexical_set(expr->pair.car) || contains_lexical_set(expr->pair.cdr);
+}
+
 Object* eval_expr(Object* expr) {
     if (!expr) return nullptr;
     if (expr->type == INT || expr->type == STRING || expr->type == PRIMITIVE || expr->type == CLOSURE || expr->type == CONTINUATION || expr->type == PORT) return expr;
@@ -1820,19 +1931,14 @@ Object* eval_expr(Object* expr) {
     if (g_trace_letrec && should_trace_letrec_expr(expr)) {
         trace_letrec_expr("eval-expr", expr);
     }
-    // When inside an eval closure (g_eval_env_stack non-empty), skip the VM path for
-    // (set! var ...) where var is bound in the local eval frame.  The VM compiles with
-    // an empty CompileEnv so it emits GSET (global write), but lookup_name finds the
-    // local frame binding first — the two paths disagree on where the variable lives.
-    bool skip_vm_set = false;
-    if (is_symbol_name(head, "set!") && !g_eval_env_stack.empty()) {
-        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
-        if (name_obj && name_obj->type == SYMBOL && name_obj->sym) {
-            Object* tmp = nullptr;
-            skip_vm_set = lookup_lexical_now(*name_obj->sym, tmp);
-        }
-    }
-    if (!is_macro_call && !is_symbol_name(head, "call/cc") && !skip_vm_set) {
+    // VM compilation around lexical mutation is still fragile in nested eval-closure
+    // contexts. Route those expressions through the evaluator for correctness.
+    bool skip_vm_set = !g_eval_env_stack.empty() && contains_lexical_set(expr);
+
+    // Keep semantics stable: expressions containing any macro call are routed
+    // through evaluator expansion/execution instead of VM fast path.
+    bool has_macro_subexpr = contains_macro_call(expr);
+    if (!g_disable_vm_fast_path && !is_macro_call && !has_macro_subexpr && !is_symbol_name(head, "call/cc") && !skip_vm_set) {
         Object* vm_out = nullptr;
         if (try_eval_expr_via_vm(expr, vm_out)) {
             if (g_trace_letrec && should_trace_letrec_expr(expr)) {
@@ -1894,7 +2000,13 @@ Object* eval_expr(Object* expr) {
 
         if (name_obj->type == SYMBOL && name_obj->sym) {
             Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
-            Object* val = eval_expr(val_expr);
+            Object* val = nullptr;
+            if (val_expr && val_expr->type == PAIR && is_symbol_name(val_expr->pair.car, "lambda")) {
+                Object* params_expr = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.car : nullptr;
+                Object* body_list = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.cdr : nullptr;
+                val = try_make_compiled_lambda(params_expr, body_list, name_obj->sym, false);
+            }
+            if (!val) val = eval_expr(val_expr);
             define_name(*name_obj->sym, val);
             return name_obj;
         }
@@ -1903,7 +2015,8 @@ Object* eval_expr(Object* expr) {
             Object* fname = name_obj->pair.car;
             Object* params_expr = name_obj->pair.cdr;
             Object* body_list = tail;
-            Object* clo = make_eval_closure(params_expr, body_list);
+            Object* clo = try_make_compiled_lambda(params_expr, body_list, fname->sym, false);
+            if (!clo) clo = make_eval_closure(params_expr, body_list);
             if (!clo) return nullptr;
             define_name(*fname->sym, clo);
             return fname;
@@ -2129,7 +2242,13 @@ Object* eval_expr(Object* expr) {
 
         if (name_obj->type == SYMBOL && name_obj->sym) {
             Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
-            Object* val = eval_expr(val_expr);
+            Object* val = nullptr;
+            if (val_expr && val_expr->type == PAIR && is_symbol_name(val_expr->pair.car, "lambda")) {
+                Object* params_expr = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.car : nullptr;
+                Object* body_list = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.cdr : nullptr;
+                val = try_make_compiled_lambda(params_expr, body_list, name_obj->sym, true);
+            }
+            if (!val) val = eval_expr(val_expr);
             if (!val || (val->type != PRIMITIVE && val->type != CLOSURE && val->type != CONTINUATION)) {
                 return nullptr;
             }
@@ -2141,7 +2260,8 @@ Object* eval_expr(Object* expr) {
             Object* mname = name_obj->pair.car;
             Object* params_expr = name_obj->pair.cdr;
             Object* body_list = tail;
-            Object* clo = make_eval_closure(params_expr, body_list);
+            Object* clo = try_make_compiled_lambda(params_expr, body_list, mname->sym, true);
+            if (!clo) clo = make_eval_closure(params_expr, body_list);
             if (!clo) return nullptr;
             macros[*mname->sym] = clo;
             return mname;
@@ -2446,14 +2566,20 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     }
                     std::reverse(args.begin(), args.end());
 
-                    ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
-                    
-                    ctx.s.clear();
-                    ctx.e = *clo->closure.env;
-                    ctx.e.insert(ctx.e.begin(), args);
-                    ctx.c = *clo->closure.code;
-                    if (clo->closure.constants) constants = *clo->closure.constants;
-                    pc = 0;
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        // Evaluator closure captured in CLOSURE payload.
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                        
+                        ctx.s.clear();
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
+                    }
 
                 } else if (clo->type == CONTINUATION) {
                     Object* cont_val = (nargs > 0) ? ctx.s.back() : nullptr;
@@ -2475,6 +2601,17 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 if (!ctx.s.empty()) {
                     Object* assigned = ctx.s.back();
                     set_lvar(ctx.e, i, j, assigned);
+
+                    // CALL/CALLG builds callee env by value-copying caller env.
+                    // For non-local mutation (i > 0), mirror the update into the
+                    // caller frame saved on dump so the write survives RTN restore.
+                    if (i > 0 && !ctx.d.empty()) {
+                        DumpFrame& caller = ctx.d.back();
+                        size_t caller_i = i - 1;
+                        if (caller_i < caller.e.size() && j < caller.e[caller_i].size()) {
+                            caller.e[caller_i][j] = assigned;
+                        }
+                    }
 
                     // letrec は「先に nil を束縛してから set!」で初期化するため、
                     // 値コピーで捕捉したクロージャ環境にも同じ更新を反映する。
@@ -2523,15 +2660,20 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     Object* result = clo->prim ? (*clo->prim)(args) : nullptr;
                     ctx.s.push_back(result);
                 } else if (clo->type == CLOSURE) {
-                    if (cmd == CALL) {
-                        ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
-                        ctx.s.clear();
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        if (cmd == CALL) {
+                            ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                            ctx.s.clear();
+                        }
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
                     }
-                    ctx.e = *clo->closure.env;
-                    ctx.e.insert(ctx.e.begin(), args);
-                    ctx.c = *clo->closure.code;
-                    if (clo->closure.constants) constants = *clo->closure.constants;
-                    pc = 0;
                 } else if (clo->type == CONTINUATION) {
                     Object* cont_val = args.empty() ? nullptr : args[0];
                     ctx.s = *clo->continuation.s;
@@ -2573,15 +2715,20 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     Object* result = clo->prim ? (*clo->prim)(args) : nullptr;
                     ctx.s.push_back(result);
                 } else if (clo->type == CLOSURE) {
-                    if (cmd == CALLG) {
-                        ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
-                        ctx.s.clear();
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        if (cmd == CALLG) {
+                            ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                            ctx.s.clear();
+                        }
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
                     }
-                    ctx.e = *clo->closure.env;
-                    ctx.e.insert(ctx.e.begin(), args);
-                    ctx.c = *clo->closure.code;
-                    if (clo->closure.constants) constants = *clo->closure.constants;
-                    pc = 0;
                 } else if (clo->type == CONTINUATION) {
                     Object* cont_val = args.empty() ? nullptr : args[0];
                     ctx.s = *clo->continuation.s;
@@ -3056,12 +3203,19 @@ bool load_scheme_file(const std::string& path) {
     // R5RS load semantics: evaluate file forms in the top-level environment.
     // Also restore caller lexical frames after load returns.
     EvalEnv saved_eval_env = g_eval_env_stack;
+    bool saved_disable_vm_fast_path = g_disable_vm_fast_path;
     g_eval_env_stack.clear();
+    g_disable_vm_fast_path = true;
     struct EvalEnvGuard {
         EvalEnv* slot;
         EvalEnv saved;
         ~EvalEnvGuard() { *slot = std::move(saved); }
     } eval_env_guard{&g_eval_env_stack, std::move(saved_eval_env)};
+    struct BoolGuard {
+        bool* slot;
+        bool saved;
+        ~BoolGuard() { *slot = saved; }
+    } vm_guard{&g_disable_vm_fast_path, saved_disable_vm_fast_path};
 
     for (auto* expr : exprs) {
         try {
@@ -3491,6 +3645,42 @@ void register_core_primitives() {
     add_prim("macroexpand", [](std::vector<Object*>& args) {
         if (args.empty()) return (Object*)nullptr;
         return macro_expand(args[0]);
+    });
+
+    add_prim("macroexpand-trace", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        int max_steps = 64;
+        if (args.size() >= 2 && args[1] && args[1]->type == INT) {
+            max_steps = args[1]->num;
+        }
+        return macro_expand_trace(args[0], max_steps);
+    });
+
+    add_prim("macro?", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0]) return bool_obj(false);
+        Object* x = args[0];
+        if (x->type == SYMBOL && x->sym) {
+            auto it = macros.find(*x->sym);
+            return bool_obj(it != macros.end() && it->second != nullptr);
+        }
+        for (const auto& kv : macros) {
+            if (kv.second == x) return bool_obj(true);
+        }
+        return bool_obj(false);
+    });
+
+    add_prim("macro-list", [](std::vector<Object*>& args) {
+        (void)args;
+        std::vector<std::string> names;
+        names.reserve(macros.size());
+        for (const auto& kv : macros) {
+            if (kv.second) names.push_back(kv.first);
+        }
+        std::sort(names.begin(), names.end());
+        std::vector<Object*> syms;
+        syms.reserve(names.size());
+        for (const auto& n : names) syms.push_back(get_symbol(n));
+        return vector_to_pair(syms);
     });
 
     // --- primitives missing from micro_scheme7 parity ---
