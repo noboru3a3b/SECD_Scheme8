@@ -1289,6 +1289,36 @@ bool compile_subset_expr(Object* expr, std::vector<int>& code, std::vector<Objec
     if (is_symbol_name(head, "let") || is_symbol_name(head, "let*") || is_symbol_name(head, "letrec")) {
         Object* bindings_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
         Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+
+        // named let: (let name ((var init) ...) body...)
+        // -> (letrec ((name (lambda (vars...) body...))) (name inits...))
+        if (is_symbol_name(head, "let") && bindings_expr && bindings_expr->type == SYMBOL && bindings_expr->sym) {
+            std::string loop_name = *bindings_expr->sym;
+            Object* real_bindings = (body_list && body_list->type == PAIR) ? body_list->pair.car : nullptr;
+            Object* real_body = (body_list && body_list->type == PAIR) ? body_list->pair.cdr : nullptr;
+
+            std::vector<std::pair<std::string, Object*>> named_binds;
+            if (!parse_binding_list(real_bindings, named_binds)) return false;
+
+            std::vector<Object*> param_list;
+            std::vector<Object*> init_list;
+            for (auto& b : named_binds) {
+                param_list.push_back(get_symbol(b.first));
+                init_list.push_back(b.second);
+            }
+
+            Object* lam = cons(get_symbol("lambda"), cons(vector_to_pair(param_list), real_body));
+            Object* letrec_bind = vector_to_pair({get_symbol(loop_name), lam});
+            Object* letrec_bindings = cons(letrec_bind, nullptr);
+
+            std::vector<Object*> call_items = {get_symbol(loop_name)};
+            call_items.insert(call_items.end(), init_list.begin(), init_list.end());
+            Object* call_expr = vector_to_pair(call_items);
+
+            Object* transformed_named_let = vector_to_pair({get_symbol("letrec"), letrec_bindings, call_expr});
+            return compile_subset_expr(transformed_named_let, code, constants, env, tail);
+        }
+
         std::vector<std::pair<std::string, Object*>> binds;
         if (!parse_binding_list(bindings_expr, binds)) return false;
 
@@ -1824,6 +1854,13 @@ bool is_special_form_name(const std::string& name) {
            name == "do";
 }
 
+std::string format_unbound_symbol_error(const std::string& name) {
+    if (is_special_form_name(name)) {
+        return "syntax keyword cannot be used as a value: " + name;
+    }
+    return "unbound symbol: " + name;
+}
+
 bool is_tagged_form(Object* obj, const std::string& tag) {
     return obj && obj->type == PAIR && is_symbol_name(obj->pair.car, tag) && obj->pair.cdr &&
            obj->pair.cdr->type == PAIR && !obj->pair.cdr->pair.cdr;
@@ -1913,7 +1950,7 @@ Object* eval_expr(Object* expr) {
     if (expr->type == SYMBOL) {
         Object* v = lookup_name(*expr->sym);
         if (v) return v;
-        throw VMError("unbound symbol: " + *expr->sym);
+        throw VMError(format_unbound_symbol_error(*expr->sym));
     }
     if (expr->type != PAIR) return expr;
 
@@ -2504,7 +2541,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 std::string var_name = *constants[const_idx]->sym;
                 auto it = globals.find(var_name);
                 if (it == globals.end()) {
-                    throw VMError("unbound symbol: " + var_name);
+                    throw VMError(format_unbound_symbol_error(var_name));
                 }
                 ctx.s.push_back(it->second);
                 break;
