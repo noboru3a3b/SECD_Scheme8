@@ -172,6 +172,7 @@ using EvalFrame = std::unordered_map<std::string, Object*>;
 using EvalEnv = std::vector<EvalFrame>;
 std::vector<EvalFrame> g_eval_env_stack;
 std::unordered_map<Object*, EvalEnv> g_closure_lexenv;
+std::vector<Object*> g_temp_gc_roots;
 int g_vm_subset_success_count = 0;
 int g_vm_subset_failure_count = 0;
 bool g_trace_letrec = false;
@@ -426,6 +427,7 @@ void mark(Object* obj) {
                 for (auto& e_frame : frame.e) {
                     for (auto& e_item : e_frame) mark(e_item);
                 }
+                for (auto& c_item : frame.constants) mark(c_item);
             }
         }
         if (obj->continuation.constants) {
@@ -472,11 +474,13 @@ void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
     for (auto& frame : g_eval_env_stack) {
         for (auto& kv : frame) mark(kv.second);
     }
+    for (auto& obj : g_temp_gc_roots) mark(obj);
     for (auto& frame : ctx.d) {
         for (auto& s_item : frame.s) mark(s_item);
         for (auto& e_frame : frame.e) {
             for (auto& e_item : e_frame) mark(e_item);
         }
+        for (auto& c_item : frame.constants) mark(c_item);
     }
 
     // Prune dead closure keys before tracing captured lexical environments.
@@ -1631,10 +1635,32 @@ Object* try_make_compiled_lambda(Object* params_expr, Object* body_list, const s
     return ok ? compiled : nullptr;
 }
 
+struct TempRootScope {
+    size_t saved;
+    TempRootScope() : saved(g_temp_gc_roots.size()) {}
+    ~TempRootScope() { g_temp_gc_roots.resize(saved); }
+    void add(Object* obj) { g_temp_gc_roots.push_back(obj); }
+    void add_all(const std::vector<Object*>& objs) {
+        for (Object* obj : objs) g_temp_gc_roots.push_back(obj);
+    }
+};
+
+Object* call_primitive_rooted(Object* prim, std::vector<Object*>& args) {
+    if (!prim || prim->type != PRIMITIVE || !prim->prim) return nullptr;
+    TempRootScope roots;
+    roots.add(prim);
+    roots.add_all(args);
+    return (*prim->prim)(args);
+}
+
 Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
     if (!proc) throw VMError("attempt to call nil");
+    TempRootScope call_roots;
+    call_roots.add(proc);
+    call_roots.add_all(args);
     if (proc->type == PRIMITIVE) {
-        return proc->prim ? (*proc->prim)(const_cast<std::vector<Object*>&>(args)) : nullptr;
+        std::vector<Object*> rooted_args(args.begin(), args.end());
+        return call_primitive_rooted(proc, rooted_args);
     }
     if (proc->type == CLOSURE && proc->closure.code && proc->closure.env) {
         if (proc->closure.constants && proc->closure.constants->size() >= 2 && proc->closure.code->empty()) {
@@ -2526,7 +2552,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     auto it = globals.find(fallback);
                     if (it != globals.end() && it->second && it->second->type == PRIMITIVE && it->second->prim) {
                         std::vector<Object*> args = {left, right};
-                        ctx.s.push_back((*it->second->prim)(args));
+                        ctx.s.push_back(call_primitive_rooted(it->second, args));
                     } else {
                         ctx.s.push_back(nullptr);
                     }
@@ -2589,7 +2615,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                         prim_args.push_back(ctx.s[ctx.s.size() - nargs + i]);
                     }
 
-                    Object* result = (*clo->prim)(prim_args);
+                    Object* result = call_primitive_rooted(clo, prim_args);
 
                     for (int i = 0; i < nargs; ++i) ctx.s.pop_back();
                     
@@ -2694,7 +2720,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 }
 
                 if (clo->type == PRIMITIVE) {
-                    Object* result = clo->prim ? (*clo->prim)(args) : nullptr;
+                    Object* result = call_primitive_rooted(clo, args);
                     ctx.s.push_back(result);
                 } else if (clo->type == CLOSURE) {
                     if (clo->closure.code && clo->closure.code->empty()) {
@@ -2749,7 +2775,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     throw VMError("attempt to call nil");
                 }
                 if (clo->type == PRIMITIVE) {
-                    Object* result = clo->prim ? (*clo->prim)(args) : nullptr;
+                    Object* result = call_primitive_rooted(clo, args);
                     ctx.s.push_back(result);
                 } else if (clo->type == CLOSURE) {
                     if (clo->closure.code && clo->closure.code->empty()) {
@@ -2910,7 +2936,7 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 std::vector<Object*> fn_args = {cont};
                 if (!fn) { ctx.s.push_back(nullptr); break; }
                 if (fn->type == PRIMITIVE) {
-                    Object* r = fn->prim ? (*fn->prim)(fn_args) : nullptr;
+                    Object* r = call_primitive_rooted(fn, fn_args);
                     ctx.s.push_back(r);
                 } else if (fn->type == CLOSURE) {
                     ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
