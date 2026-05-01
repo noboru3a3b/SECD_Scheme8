@@ -51,21 +51,17 @@
 
 (define make-iter
   (lambda (proc . args)
-    (letrec ((iter
-              (lambda (return)
-                (apply
-                  proc
-                  (lambda (x)
-                    (set! return
-                      (call/cc
-                        (lambda (cont)
-                          (set! iter cont)
-                          (return x)))))
-                  args)
-                (return false))))
-      (lambda ()
-        (call/cc
-          (lambda (cont) (iter cont)))))))
+    (let ((state (cons '() '())))
+      (let ((emit
+             (lambda (x)
+               (set-car! state (append (car state) (list x))))))
+        (apply proc emit args)
+        (lambda ()
+          (if (null? (car state))
+              false
+              (let ((x (car (car state))))
+                (set-car! state (cdr (car state)))
+                x)))))))
 
 (define for-each-tree
   (lambda (fn ls)
@@ -83,14 +79,13 @@
 
 (define make-promise
   (lambda (f)
-    (let ((flag false) (result false))
+    (let ((state (cons false false)))
       (lambda ()
-        (if (not flag)
-            (let ((x (f)))
-              (if (not flag)
-                  (begin (set! flag true)
-                         (set! result x)))))
-        result))))
+        (if (not (car state))
+            (begin
+              (set-car! state true)
+              (set-cdr! state (f))))
+        (cdr state)))))
 
 (define force
   (lambda (promise) (promise)))

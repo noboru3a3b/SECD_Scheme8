@@ -4456,6 +4456,15 @@ int run_full_selftest() {
     expect_eq("(let loop ((n 5) (acc 1)) (if (= n 0) acc (loop (- n 1) (* acc n))))", "120");
     expect_eq("(do ((i 0 (+ i 1)) (s 0 (+ s i))) ((= i 5) s))", "10");
 
+    // --- mlib utility coverage (map-2 / delay-force / tree / iterator) ---
+    expect_eq("(map-2 + (list 1 2 3) (list 4 5 6))", "(5 7 9)");
+    expect_eq("(map-2 cons (quote (a b)) (quote (1 2)))", "((a . 1) (b . 2))");
+    expect_eq("(begin (define p (delay (+ 1 2))) (force p))", "3");
+    expect_eq("(begin (define cnt 0) (define p (delay (begin (set! cnt (+ cnt 1)) 42))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
+    expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+
     if (failures == 0) {
         std::cout << "[selftest-full] all tests passed." << std::endl;
     } else {
@@ -4463,6 +4472,60 @@ int run_full_selftest() {
     }
     std::cout << "[selftest-full] compilation: " << g_vm_subset_success_count << " success, "
               << g_vm_subset_failure_count << " fallback to evaluator" << std::endl;
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_mlib_utils_selftest() {
+    init_env(true);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    int failures = 0;
+    auto expect_eq = [&](const std::string& expr, const std::string& expected) {
+        test_ctx.s.clear();
+        Object* result = eval_from_source(expr, test_ctx, constants);
+        std::string got;
+        if (!result) got = "nil";
+        else if (result->type == INT) got = (result->num ? (result->num == 1 && expected == "true" ? "true" : (result->num == 0 && expected == "false" ? "false" : std::to_string(result->num))) : "false");
+        else got = object_to_string(result);
+
+        if (result && result->type == INT) {
+            if (expected == "true" && result->num != 0) got = "true";
+            else if (expected == "false" && result->num == 0) got = "false";
+            else got = std::to_string(result->num);
+        }
+
+        if (got != expected) {
+            failures++;
+            std::cout << "[selftest-mlib-utils][FAIL] " << expr
+                      << "  expected=" << expected << "  got=" << got << std::endl;
+        } else {
+            std::cout << "[selftest-mlib-utils][PASS] " << expr << std::endl;
+        }
+    };
+
+    expect_eq("(map-2 + (list 1 2 3) (list 4 5 6))", "(5 7 9)");
+    expect_eq("(map-2 cons (quote (a b)) (quote (1 2)))", "((a . 1) (b . 2))");
+    expect_eq("(begin (define p (delay (+ 1 2))) (force p))", "3");
+    expect_eq("(begin (define cnt 0) (define p (delay (begin (set! cnt (+ cnt 1)) 42))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
+    expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+
+    if (failures == 0) {
+        std::cout << "[selftest-mlib-utils] all tests passed." << std::endl;
+    } else {
+        std::cout << "[selftest-mlib-utils] " << failures << " test(s) FAILED." << std::endl;
+    }
 
     cleanup_heap();
     globals.clear();
@@ -4740,6 +4803,7 @@ int run_compare_mlib_selftest() {
 //   --selftest-eval  : 評価器・コンパイラの動作テストを実行
 //   --selftest-full  : mlib を含む総合テストを実行
 //   --selftest-mlib-compare : mlib あり/なしの結果差分を比較
+//   --selftest-mlib-utils   : mlib ユーティリティの回帰テストを実行
 //   (引数なし)       : REPL を起動
 //
 // REPL ループ:
@@ -4765,6 +4829,9 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "--selftest-mlib-compare") {
         return run_compare_mlib_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-mlib-utils") {
+        return run_mlib_utils_selftest();
     }
 
     init_env();
