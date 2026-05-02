@@ -1,44 +1,46 @@
-# micro Scheme 10B 解説
+# micro Scheme 10 実装解説（単体完結版）
 
-最終更新: 2026-05-01  
-対象実装: micro_scheme10.cpp（現行）
-
----
-
-## 1. 本ドキュメントの目的
-
-この文書は、ここ数日の改修を反映した micro_scheme10.cpp の最新仕様を整理するためのものです。  
-とくに次の更新点を反映しています。
-
-- selftest の拡充（mlib utility カバレッジ）
-- 新オプション `--selftest-mlib-utils` の追加
-- mlib8.scm 側の `make-promise` / `make-iter` の互換実装調整
+最終更新: 2026-05-02  
+対象: micro_scheme10.cpp / mlib8.scm（現行）
 
 ---
 
-## 2. 実行モデルの要点
+## 1. この文書の位置付け
 
-micro Scheme 10 は、次のハイブリッド実行系です。
+この文書は、micro Scheme 10 の現行実装を、この文書だけで理解できるように整理したものです。  
+旧版文書の参照を前提にせず、次を一通り説明します。
 
-- VM（コンパイル済みバイトコードを実行）
-- evaluator（S 式を直接評価）
-
-基本動作は「まず VM コンパイルを試す。難しい式は evaluator にフォールバック」です。
-
-```
-入力式
-  -> compile_subset_expr() を試行
-     -> 成功: vm() 実行
-     -> 失敗: eval_expr() で評価
-```
-
-このため、コンパイル失敗件数が 0 でないこと自体は異常ではありません。
+- 実行モデル（VM と evaluator の役割分担）
+- データ構造と GC の要点
+- call/cc と継続再開の扱い
+- mlib8.scm との境界
+- 現在のセルフテスト体系と運用
+- 最近の修正ポイントと既知挙動
 
 ---
 
-## 3. データ型と主要構造
+## 2. 全体アーキテクチャ
 
-実装上の Type は以下です。
+micro Scheme 10 はハイブリッド実行系です。
+
+- VM 経路: 式をバイトコードへコンパイルして高速実行
+- evaluator 経路: 直接評価（複雑式や安全側フォールバック）
+
+基本フローは次の通りです。
+
+1. 入力式を読み取り
+2. compile_subset_expr で VM コンパイルを試行
+3. 成功なら vm 実行
+4. 失敗なら evaluator にフォールバック
+
+したがって、コンパイル失敗件数が 0 でないこと自体は正常です。  
+設計上、正しさ優先で evaluator 側に落とすケースがあります。
+
+---
+
+## 3. サポート型と実行コンテキスト
+
+主要 Type:
 
 - INT / INT64 / DOUBLE
 - SYMBOL / STRING
@@ -46,160 +48,190 @@ micro Scheme 10 は、次のハイブリッド実行系です。
 - CLOSURE
 - CONTINUATION
 - PRIMITIVE
+- VECTOR
 - PORT
 - UNDEF
-- VECTOR
 
-`VECTOR` は micro_scheme10 系で明示対応済みで、GC の mark/sweep にも追跡対象として組み込まれています。
+実行中に重要な状態:
 
----
-
-## 4. 初期化と mlib 読み込み
-
-`init_env(load_mlib=true)` は次を行います。
-
-1. `true`, `false`, `:undef`, `:eof` の登録
-2. コアプリミティブ登録
-3. `mlib8.scm` を条件付き読み込み
-4. ブートストラップ評価後に lexical frame をクリア
-
-注意点:
-
-- 読み込むのは `mlib8.scm`（C++ 実装と衝突しない調整版）
-- C++ 側内蔵の特殊形式（let/cond/do など）を mlib 側で再定義しない方針
+- VMContext: S/E/C/D レジスタ相当（スタック、環境、コード、ダンプ）
+- globals / macros / symbols: グローバルテーブル
+- g_eval_env_stack: evaluator 用 lexical 環境
+- g_closure_lexenv: eval 系クロージャが捕捉した lexical 環境
 
 ---
 
-## 5. 直近改修の重要点
+## 4. 初期化と mlib8.scm
 
-### 5.1 selftest-full の mlib utility 拡充
+init_env(load_mlib=true) の概略:
 
-`run_full_selftest()` に次の検証を追加済みです。
+1. true/false/:undef/:eof を登録
+2. コアプリミティブを登録
+3. mlib8.scm を読み込み
+4. ブートストラップ評価後に一時 lexical frame を整理
 
-- `map-2`
-- `delay` / `force`
-- `make-promise`（メモ化が 1 回だけ評価されること）
-- `for-each-tree`
-- `make-iter`
+方針:
 
-### 5.2 新オプション `--selftest-mlib-utils`
-
-`run_mlib_utils_selftest()` を追加し、上記 utility のみを短時間で回帰確認できるようにしました。
-
-```powershell
-.\micro_scheme10.exe --selftest-mlib-utils
-```
-
-### 5.3 mlib8.scm の互換調整
-
-以下を「状態セル（pair）で保持する方式」に変更済みです。
-
-- `make-promise`
-- `make-iter`
-
-背景:
-
-- 旧実装（`set!` による局所変数再束縛）では、現行 evaluator/VM の組み合わせで期待どおりに状態保持されず、
-  promise の再評価や iterator の戻り値不整合が出るケースがありました。
-- 状態セル方式にすることで、期待した挙動に安定しました。
-
-補足:
-
-- `(list (it) (it) (it) (it))` の最終値は false 表示が `0` として出るため、期待値は `(10 20 30 0)` に合わせています。
+- C++ 実装済みの特殊形式（let, let*, letrec, begin, and, or, cond, case, do など）を mlib で再定義しない
+- mlib は補助関数群に集中し、VM/evaluator の評価経路を乱さない
 
 ---
 
-## 6. 現在のセルフテスト体系
+## 5. GC 設計と最近の安定化
 
-### 6.1 GC 簡易テスト
+### 5.1 GC 方式
 
-```powershell
-.\micro_scheme10.exe --selftest
-```
+- Mark & Sweep
+- ルートは VMContext（S/E/D）、constants、globals/macros/symbols、一時 roots など
 
-### 6.2 evaluator/VM 経路テスト
+### 5.2 g_closure_lexenv の剪定
 
-```powershell
-.\micro_scheme10.exe --selftest-eval
-```
+GC 時に、g_closure_lexenv の key（クロージャ）が未到達なら削除します。  
+これにより古い lexical 捕捉情報の蓄積を抑えます。
 
-- 経路ログ（`[ROUTE] vm/evaluator`）を表示
-- コンパイル成功件数 / フォールバック件数を表示
+### 5.3 中間オブジェクト誤回収対策
 
-### 6.3 総合テスト
+重い cons 連鎖や call frame 構築中に GC が走る場合を想定し、
 
-```powershell
-.\micro_scheme10.exe --selftest-full
-```
+- vector_to_pair
+- build_vm_call_frame
 
-- 言語機能全般 + mlib utility 拡張ケース
-
-### 6.4 mlib 有無比較
-
-```powershell
-.\micro_scheme10.exe --selftest-mlib-compare
-```
-
-- `load_mlib=false/true` の評価結果を大量ケースで比較
-- 期待は `mismatches=0`
-
-### 6.5 mlib utility 専用
-
-```powershell
-.\micro_scheme10.exe --selftest-mlib-utils
-```
-
-- map-2 / delay-force / make-promise / for-each-tree / make-iter を集中確認
+で中間生成物を一時ルートに保持するよう修正済みです。  
+これにより、高負荷時の値崩れや不安定挙動を防止しています。
 
 ---
 
-## 7. 直近の確認結果（2026-05-01）
+## 6. call/cc と継続実装
 
-手元実行で以下を確認済みです。
+### 6.1 基本方針
 
-- `--selftest` : 正常
-- `--selftest-eval` : all tests passed (38)
-- `--selftest-full` : all tests passed
-- `--selftest-mlib-compare` : total_cases=800, mismatches=0
-- `--selftest-mlib-utils` : all tests passed
+- VM の CALLCC 命令で CONTINUATION を捕捉
+- 継続オブジェクトに S/E/C/D と constants を保存
+- 継続再開時は保存コンテキストへ復帰
 
-現時点では、今回追加した機能・互換修正を含めて回帰は確認されていません。
+### 6.2 C++ プリミティブ境界を跨ぐ非局所脱出
 
----
-
-## 8. 既知の設計注意
-
-- 「コンパイル失敗件数 > 0」自体は、フォールバック設計上あり得る
-- 速度最適化より、正しさ優先で evaluator に落とすケースがある
-- mlib は C++ 内蔵機能と重複再定義しない前提で運用する
+継続呼び出しが VM セッション内で起きた場合、通常 return ではなく ContinuationEscape で unwind し、
+適切な VM 呼び出しフレームまで戻して復元する設計です。  
+これにより apply / for-each 経由の call/cc でも一貫性を保ちます。
 
 ---
 
-## 9. 運用推奨
+## 7. mlib8.scm 側ユーティリティ仕様（現行）
 
-変更時は次の順で確認するのが安全です。
+### 7.1 make-promise / delay / force
 
-1. `--selftest-full`
-2. `--selftest-eval`
-3. `--selftest-mlib-compare`
-4. mlib まわりを触った場合は `--selftest-mlib-utils`
+- promise は一度だけ本体を評価し、以後はキャッシュ値を返す
 
-必要に応じて `MS_TRACE_LETREC=1` を使って追跡します。
+### 7.2 make-iter / make-iter-lazy
 
-```powershell
-$env:MS_TRACE_LETREC='1'
-.\micro_scheme10.exe --selftest-eval
-```
+- 現在は make-iter-lazy-available が true
+- make-iter は make-iter-lazy を既定で使用
+- 期待挙動例: (list (it) (it) (it) (it)) が (10 20 30 0)
+
+0 は false 表示です（実装上 false は整数 0 相当として表示される場面があります）。
 
 ---
 
-## 10. まとめ
+## 8. セルフテスト一覧
 
-micro Scheme 10B（現行）は、
+### 8.1 GC 簡易
 
-- VM + evaluator のハイブリッド実行
-- mlib8 競合回避方針
-- selftest 拡充（mlib utility を直接検証）
-- 追加オプション `--selftest-mlib-utils`
+- micro_scheme10.exe --selftest
 
-を備えた、保守しやすい実運用向け構成になっています。
+### 8.2 evaluator/VM 検証
+
+- micro_scheme10.exe --selftest-eval
+
+出力内容:
+
+- 全ケース pass/fail
+- vm route 使用件数
+- compilation success/fallback 件数
+
+補足: ROUTE 詳細ログは通常非表示。必要時のみ以下で有効化。
+
+- MS_TRACE_SELFTEST_ROUTE=1
+
+### 8.3 総合
+
+- micro_scheme10.exe --selftest-full
+
+言語機能 + mlib utility + call/cc をまとめて確認します。
+
+### 8.4 mlib 比較
+
+- micro_scheme10.exe --selftest-mlib-compare
+
+load_mlib=false/true で結果一致を確認します。  
+期待値は mismatches=0。
+
+### 8.5 mlib utility 集中
+
+- micro_scheme10.exe --selftest-mlib-utils
+
+対象:
+
+- map-2
+- delay/force
+- make-promise
+- for-each-tree
+- make-iter / make-iter-lazy
+
+### 8.6 call/cc 集中
+
+- micro_scheme10.exe --selftest-callcc
+
+対象:
+
+- 基本 escape
+- 継続保存と再呼び出し
+- 早期脱出パターン
+- iterator と call/cc の相互作用
+
+---
+
+## 9. 既知挙動と読み方
+
+### 9.1 GC ログの lexenv と REPL 末尾 LexEnv が違う
+
+これは表示タイミング差で起こり得ます。
+
+- GC ログ: GC 実行時点
+- REPL の Heap size / LexEnv: 式評価完了時点
+
+### 9.2 fallback 件数がある
+
+異常ではありません。  
+VM コンパイル非対応構文や安全側判定で evaluator に回る設計です。
+
+---
+
+## 10. 日常運用の推奨手順
+
+実装変更後の推奨確認順:
+
+1. micro_scheme10.exe --selftest-full
+2. micro_scheme10.exe --selftest-eval
+3. micro_scheme10.exe --selftest-callcc
+4. mlib 変更時は --selftest-mlib-utils と --selftest-mlib-compare も実行
+
+必要なトレース例:
+
+- MS_TRACE_LETREC=1
+- MS_TRACE_CALLCC=1
+- MS_TRACE_VM_ALL=1
+- MS_TRACE_SELFTEST_ROUTE=1
+
+---
+
+## 11. まとめ
+
+現行 10 は、
+
+- VM と evaluator のハイブリッド実行
+- call/cc を含む継続復帰の安定化
+- GC での中間オブジェクト保護強化
+- mlib8 utility を含むセルフテスト体系の整備
+
+まで含めて、単体で保守・検証しやすい状態です。

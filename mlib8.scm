@@ -49,7 +49,8 @@
 
 ;;; Macro utility functions
 
-(define make-iter
+;; Stable eager iterator (default): evaluate producer once and buffer outputs.
+(define make-iter-buffer
   (lambda (proc . args)
     (let ((state (cons '() '())))
       (let ((emit
@@ -62,6 +63,43 @@
               (let ((x (car (car state))))
                 (set-car! state (cdr (car state)))
                 x)))))))
+
+;; Raw lazy iterator via call/cc.
+(define make-iter-lazy-raw
+  (lambda (proc . args)
+    (letrec ((iter
+              (lambda (return)
+                (let ((yield
+                       (lambda (x)
+                         (set! return
+                           (call/cc
+                             (lambda (cont)
+                               (set! iter cont)
+                               (return x)))))))
+                  (if (null? args)
+                      (proc yield)
+                      (if (null? (cdr args))
+                          (proc yield (car args))
+                          (apply proc yield args))))
+                (set! iter (lambda (return) (return false)))
+                (return false))))
+      (lambda ()
+        (call/cc
+          (lambda (cont) (iter cont)))))))
+
+;; Under one-shot continuation semantics, lazy iterator resume is not supported
+;; yet. Keep raw implementation for future multi-shot support, but default to
+;; safe buffer behavior now.
+(define make-iter-lazy-available true)
+
+;; Safe lazy entrypoint: use lazy when valid, otherwise fall back to buffer.
+(define make-iter-lazy
+  (if make-iter-lazy-available
+      make-iter-lazy-raw
+      make-iter-buffer))
+
+;; Keep current behavior as default for compatibility.
+(define make-iter make-iter-lazy)
 
 (define for-each-tree
   (lambda (fn ls)

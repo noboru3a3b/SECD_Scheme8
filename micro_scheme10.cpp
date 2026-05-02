@@ -98,6 +98,8 @@ struct Object {
             std::vector<int>* code;
             std::vector<std::vector<Object*>>* env;
             std::vector<Object*>* constants;
+            int vm_fixed_arity;
+            bool vm_has_rest;
         } closure;
         struct {
             std::fstream* file;
@@ -107,6 +109,9 @@ struct Object {
             std::vector<Object*>* s; std::vector<std::vector<Object*>>* e;
             std::vector<int>* c; std::vector<DumpFrame>* d;
             std::vector<Object*>* constants;
+            unsigned long long id;
+            unsigned long long vm_session_id;
+            bool used;
         } continuation;
         std::function<Object*(std::vector<Object*>&)>* prim;
         std::vector<Object*>* vec;  // VECTOR type: ヒープ上要素の配列
@@ -119,10 +124,10 @@ struct Object {
         else if (t == SYMBOL) sym = nullptr;
         else if (t == STRING) str = nullptr;
         else if (t == PAIR) { pair.car = nullptr; pair.cdr = nullptr; }
-        else if (t == CLOSURE) { closure.code = nullptr; closure.env = nullptr; closure.constants = nullptr; }
+        else if (t == CLOSURE) { closure.code = nullptr; closure.env = nullptr; closure.constants = nullptr; closure.vm_fixed_arity = 0; closure.vm_has_rest = false; }
         else if (t == PORT) { port.file = nullptr; port.is_output = false; }
         else if (t == CONTINUATION) { continuation.s = nullptr; continuation.e = nullptr; 
-                                     continuation.c = nullptr; continuation.d = nullptr; continuation.constants = nullptr; }
+                                     continuation.c = nullptr; continuation.d = nullptr; continuation.constants = nullptr; continuation.id = 0; continuation.vm_session_id = 0; continuation.used = false; }
         else if (t == PRIMITIVE) prim = nullptr;
         else if (t == VECTOR) vec = nullptr;
     }
@@ -176,10 +181,18 @@ std::vector<Object*> g_temp_gc_roots;
 int g_vm_subset_success_count = 0;
 int g_vm_subset_failure_count = 0;
 bool g_trace_letrec = false;
+bool g_trace_callcc = false;
+bool g_trace_selftest_route = false;
 bool g_disable_vm_fast_path = false;
 int g_trace_vm_session = 0;
 long long g_do_loop_counter = 0;
-const size_t MAX_OBJECTS = 100000;  // この件数を超えたら GC を発動
+unsigned long long g_callcc_next_id = 1;
+unsigned long long g_vm_invocation_next_id = 1;
+unsigned long long g_last_cont_restore_id = 0;
+std::string g_last_cont_restore_tag;
+thread_local int g_vm_call_depth = 0;
+thread_local std::vector<unsigned long long> g_vm_invocation_stack;
+const size_t MAX_OBJECTS = 1000000;  // この件数を超えたら GC を発動
 const size_t MAX_VM_STEPS = 100000000; // VM 実行ステップ上限
 const size_t GC_WARN_HEAP_HIGH_PERCENT = 95;   // GC 後 heap が上限の 95% 以上
 const size_t GC_WARN_LOW_COLLECT_PERCENT = 1;  // 回収率 1% 以下を低回収とみなす
@@ -206,6 +219,24 @@ static size_t effective_heap_weight();
 Object* macro_expand_1(Object* expr);
 Object* macro_expand(Object* expr);
 static bool contains_macro_call(Object* expr);
+static void mark_continuation_use_or_throw(Object* cont);
+
+static void trace_callcc_event(const std::string& tag, unsigned long long id,
+                               size_t s, size_t e, size_t d, size_t c) {
+    if (!g_trace_callcc) return;
+    std::cerr << "[trace-callcc] " << tag
+              << " id=" << id
+              << " s=" << s
+              << " e=" << e
+              << " d=" << d
+              << " c=" << c
+              << std::endl;
+}
+
+static void record_last_cont_restore(const std::string& tag, unsigned long long id) {
+    g_last_cont_restore_tag = tag;
+    g_last_cont_restore_id = id;
+}
 
 struct ParseError : public std::runtime_error {
     explicit ParseError(const std::string& msg) : std::runtime_error(msg) {}
@@ -213,6 +244,12 @@ struct ParseError : public std::runtime_error {
 struct VMError : public std::runtime_error {
     explicit VMError(const std::string& msg) : std::runtime_error(msg) {}
 };
+
+static void mark_continuation_use_or_throw(Object* cont) {
+    if (!cont || cont->type != CONTINUATION) {
+        throw VMError("internal error: invalid continuation object");
+    }
+}
 
 struct ContinuationEscape {
     Object* tag;
@@ -992,14 +1029,32 @@ void print_code_stream(const std::vector<int>& code, std::ostream& os, const std
     os << ")";
 }
 
+static Object* make_lex_cell(Object* value) {
+    return cons(value, nullptr);
+}
+
+static Object* read_lex_slot(Object* slot) {
+    if (slot && slot->type == PAIR) return slot->pair.car;
+    return slot;
+}
+
+static void write_lex_slot(Object* slot, Object* value) {
+    if (slot && slot->type == PAIR) slot->pair.car = value;
+}
+
 Object* get_lvar(std::vector<std::vector<Object*>>& e, size_t i, size_t j) {
-    if (i < e.size() && j < e[i].size()) return e[i][j];
+    if (i < e.size() && j < e[i].size()) return read_lex_slot(e[i][j]);
     return nullptr;
 }
 
 void set_lvar(std::vector<std::vector<Object*>>& e, size_t i, size_t j, Object* val) {
     if (i < e.size() && j < e[i].size()) {
-        e[i][j] = val;
+        Object* slot = e[i][j];
+        if (slot && slot->type == PAIR) {
+            write_lex_slot(slot, val);
+        } else {
+            e[i][j] = make_lex_cell(val);
+        }
     } else {
         std::cerr << "VM Error: LVAR access out of range (" << i << ", " << j << ")" << std::endl;
     }
@@ -1019,10 +1074,23 @@ std::vector<Object*> pair_to_vector(Object* lst) {
 }
 
 Object* vector_to_pair(const std::vector<Object*>& items) {
+    size_t saved_roots = g_temp_gc_roots.size();
+    for (Object* item : items) g_temp_gc_roots.push_back(item);
+    // Keep the currently built list head alive across cons allocations.
+    size_t out_root_index = g_temp_gc_roots.size();
+    g_temp_gc_roots.push_back(nullptr);
     Object* out = nullptr;
-    for (auto it = items.rbegin(); it != items.rend(); ++it) {
-        out = cons(*it, out);
+    try {
+        for (auto it = items.rbegin(); it != items.rend(); ++it) {
+            g_temp_gc_roots[out_root_index] = out;
+            out = cons(*it, out);
+            g_temp_gc_roots[out_root_index] = out;
+        }
+    } catch (...) {
+        g_temp_gc_roots.resize(saved_roots);
+        throw;
     }
+    g_temp_gc_roots.resize(saved_roots);
     return out;
 }
 
@@ -1055,12 +1123,52 @@ bool find_local(const CompileEnv& env, const std::string& name, int& level, int&
     return false;
 }
 
-Object* make_vm_code_closure_constant(const std::vector<int>& body_code) {
+Object* make_vm_code_closure_constant(const std::vector<int>& body_code, const ParamSpec& spec) {
     Object* clo = alloc(CLOSURE);
     clo->closure.code = new std::vector<int>(body_code);
     clo->closure.env = new std::vector<std::vector<Object*>>();
     clo->closure.constants = new std::vector<Object*>();
+    clo->closure.vm_fixed_arity = static_cast<int>(spec.fixed.size());
+    clo->closure.vm_has_rest = spec.has_rest;
     return clo;
+}
+
+bool build_vm_call_frame(Object* clo, const std::vector<Object*>& args, std::vector<Object*>& frame) {
+    if (!clo || clo->type != CLOSURE) return false;
+    int fixed_arity = clo->closure.vm_fixed_arity;
+    bool has_rest = clo->closure.vm_has_rest;
+    if ((!has_rest && static_cast<int>(args.size()) != fixed_arity) ||
+        (has_rest && static_cast<int>(args.size()) < fixed_arity)) {
+        return false;
+    }
+
+    size_t saved_roots = g_temp_gc_roots.size();
+    g_temp_gc_roots.push_back(clo);
+    for (Object* arg : args) g_temp_gc_roots.push_back(arg);
+
+    frame.clear();
+    frame.reserve(static_cast<size_t>(fixed_arity + (has_rest ? 1 : 0)));
+    try {
+        for (int i = 0; i < fixed_arity; ++i) {
+            Object* slot = make_lex_cell(args[static_cast<size_t>(i)]);
+            frame.push_back(slot);
+            g_temp_gc_roots.push_back(slot);
+        }
+        if (has_rest) {
+            std::vector<Object*> rest_items(args.begin() + fixed_arity, args.end());
+            Object* rest_list = vector_to_pair(rest_items);
+            g_temp_gc_roots.push_back(rest_list);
+            Object* rest_slot = make_lex_cell(rest_list);
+            frame.push_back(rest_slot);
+            g_temp_gc_roots.push_back(rest_slot);
+        }
+    } catch (...) {
+        g_temp_gc_roots.resize(saved_roots);
+        throw;
+    }
+
+    g_temp_gc_roots.resize(saved_roots);
+    return true;
 }
 
 // ------------------------------------------------------------
@@ -1195,10 +1303,14 @@ bool compile_subset_expr(Object* expr, std::vector<int>& code, std::vector<Objec
         Object* params_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
         Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
         ParamSpec spec;
-        if (!extract_param_spec(params_expr, spec) || spec.has_rest) return false;
+        if (!extract_param_spec(params_expr, spec)) return false;
 
         CompileEnv body_env = env;
-        body_env.insert(body_env.begin(), spec.fixed);
+        std::vector<std::string> param_frame = spec.fixed;
+        if (spec.has_rest) {
+            param_frame.push_back(spec.rest);
+        }
+        body_env.insert(body_env.begin(), std::move(param_frame));
 
         std::vector<Object*> body_forms = pair_to_vector(body_list);
         std::vector<int> body_code;
@@ -1213,7 +1325,7 @@ bool compile_subset_expr(Object* expr, std::vector<int>& code, std::vector<Objec
         }
         body_code.push_back(OP_RTN);
 
-        Object* clo_const = make_vm_code_closure_constant(body_code);
+        Object* clo_const = make_vm_code_closure_constant(body_code, spec);
         code.push_back(OP_LDF);
         code.push_back(add_constant(constants, clo_const));
         return true;
@@ -1350,7 +1462,10 @@ bool compile_subset_expr(Object* expr, std::vector<int>& code, std::vector<Objec
                 }
             }
             body_code.push_back(OP_RTN);
-            Object* clo_const = make_vm_code_closure_constant(body_code);
+            ParamSpec let_spec;
+            let_spec.fixed = params;
+            let_spec.has_rest = false;
+            Object* clo_const = make_vm_code_closure_constant(body_code, let_spec);
             code.push_back(OP_LDF);
             code.push_back(add_constant(constants, clo_const));
             code.push_back(OP_CALL);
@@ -1561,7 +1676,7 @@ bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
         value_frame.reserve(it->size());
         for (const auto& kv : *it) {
             name_frame.push_back(kv.first);
-            value_frame.push_back(kv.second);
+            value_frame.push_back(make_lex_cell(kv.second));
         }
         env.push_back(std::move(name_frame));
         vm_lex_env.push_back(std::move(value_frame));
@@ -1572,8 +1687,6 @@ bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
         if (trace_target) {
             trace_letrec_expr("vm-compile-failed", expr);
         }
-        // Uncomment next line to see all fallback cases:
-        // std::cerr << "[vm-compile] FALLBACK to evaluator: " << object_to_string(expr) << std::endl;
         return false;
     }
     code.push_back(OP_STOP);
@@ -1706,13 +1819,34 @@ Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
         }
 
         VMContext call_ctx;
+        std::vector<Object*> call_frame;
+        if (!build_vm_call_frame(proc, args, call_frame)) {
+            return nullptr;
+        }
         call_ctx.e = *proc->closure.env;
-        call_ctx.e.insert(call_ctx.e.begin(), args);
+        call_ctx.e.insert(call_ctx.e.begin(), call_frame);
         call_ctx.c = *proc->closure.code;
         std::vector<Object*> call_constants = proc->closure.constants ? *proc->closure.constants : std::vector<Object*>{};
         return vm(call_ctx, call_constants);
     }
     if (proc->type == CONTINUATION && proc->continuation.s && proc->continuation.e && proc->continuation.c && proc->continuation.d) {
+        mark_continuation_use_or_throw(proc);
+        trace_callcc_event("invoke-continuation",
+                           proc->continuation.id,
+                           proc->continuation.s->size() + 1,
+                           proc->continuation.e->size(),
+                           proc->continuation.d->size(),
+                           proc->continuation.c->size());
+        bool target_session_active = false;
+        for (unsigned long long active_id : g_vm_invocation_stack) {
+            if (active_id == proc->continuation.vm_session_id) {
+                target_session_active = true;
+                break;
+            }
+        }
+        if (g_vm_call_depth > 0 && target_session_active) {
+            throw ContinuationEscape{proc, args.empty() ? nullptr : args[0]};
+        }
         VMContext cont_ctx;
         cont_ctx.s = *proc->continuation.s;
         cont_ctx.s.push_back(args.empty() ? nullptr : args[0]);
@@ -1996,12 +2130,12 @@ Object* eval_expr(Object* expr) {
     }
     // VM compilation around lexical mutation is still fragile in nested eval-closure
     // contexts. Route those expressions through the evaluator for correctness.
-    bool skip_vm_set = !g_eval_env_stack.empty() && contains_lexical_set(expr);
+    bool skip_vm_set = !g_eval_env_stack.empty() && contains_lexical_set(expr) && !is_symbol_name(head, "call/cc");
 
     // Keep semantics stable: expressions containing any macro call are routed
     // through evaluator expansion/execution instead of VM fast path.
     bool has_macro_subexpr = contains_macro_call(expr);
-    if (!g_disable_vm_fast_path && !is_macro_call && !has_macro_subexpr && !is_symbol_name(head, "call/cc") && !skip_vm_set) {
+    if (!g_disable_vm_fast_path && !is_macro_call && !has_macro_subexpr && !skip_vm_set) {
         Object* vm_out = nullptr;
         if (try_eval_expr_via_vm(expr, vm_out)) {
             if (g_trace_letrec && should_trace_letrec_expr(expr)) {
@@ -2434,6 +2568,10 @@ enum Op {
 // VM 実行中に alloc が GC を正しく呼べるようにする。
 // ------------------------------------------------------------
 Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
+    const unsigned long long vm_invocation_id = g_vm_invocation_next_id++;
+    g_vm_call_depth++;
+    g_vm_invocation_stack.push_back(vm_invocation_id);
+    const unsigned long long vm_owner_session_id = g_vm_invocation_stack.front();
     VMContext* prev_ctx = g_active_ctx;
     std::vector<Object*>* prev_constants = g_active_constants;
     g_active_ctx = &ctx;
@@ -2443,8 +2581,15 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
     struct CtxGuard {
         VMContext** slot_ctx; VMContext* saved_ctx;
         std::vector<Object*>** slot_con; std::vector<Object*>* saved_con;
-        ~CtxGuard() { *slot_ctx = saved_ctx; *slot_con = saved_con; }
-    } ctx_guard{&g_active_ctx, prev_ctx, &g_active_constants, prev_constants};
+        int* slot_depth;
+        std::vector<unsigned long long>* invocation_stack;
+        ~CtxGuard() {
+            *slot_ctx = saved_ctx;
+            *slot_con = saved_con;
+            (*slot_depth)--;
+            if (!invocation_stack->empty()) invocation_stack->pop_back();
+        }
+    } ctx_guard{&g_active_ctx, prev_ctx, &g_active_constants, prev_constants, &g_vm_call_depth, &g_vm_invocation_stack};
 
     constexpr size_t MAX_ENV_DEPTH = 10000;
     constexpr size_t MAX_STACK_SIZE = 100000;
@@ -2453,7 +2598,9 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
     try {
         size_t pc = 0;
 
-        while (pc < ctx.c.size()) {
+        while (true) {
+            try {
+                while (pc < ctx.c.size()) {
             if (step_count++ > MAX_VM_STEPS) {
                 std::cerr << "[vm] ERROR: Exceeded maximum instruction steps (" << MAX_VM_STEPS << ")" << std::endl;
                 return nullptr;
@@ -2584,6 +2731,8 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 clo->closure.code = new std::vector<int>(*constants[idx]->closure.code);
                 clo->closure.env = new std::vector<std::vector<Object*>>(ctx.e);
                 clo->closure.constants = new std::vector<Object*>(constants);
+                clo->closure.vm_fixed_arity = constants[idx]->closure.vm_fixed_arity;
+                clo->closure.vm_has_rest = constants[idx]->closure.vm_has_rest;
                 ctx.s.push_back(clo);
                 break;
             }
@@ -2594,6 +2743,15 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 cont->continuation.c = new std::vector<int>(ctx.c.begin() + pc, ctx.c.end());
                 cont->continuation.d = new std::vector<DumpFrame>(ctx.d);
                 cont->continuation.constants = new std::vector<Object*>(constants);
+                cont->continuation.id = g_callcc_next_id++;
+                cont->continuation.vm_session_id = vm_owner_session_id;
+                cont->continuation.used = false;
+                trace_callcc_event("capture-ldct",
+                                   cont->continuation.id,
+                                   cont->continuation.s->size(),
+                                   cont->continuation.e->size(),
+                                   cont->continuation.d->size(),
+                                   cont->continuation.c->size());
                 ctx.s.push_back(cont);
                 break;
             }
@@ -2634,11 +2792,15 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                         Object* result = invoke_callable(clo, args);
                         ctx.s.push_back(result);
                     } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
                         ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
                         
                         ctx.s.clear();
                         ctx.e = *clo->closure.env;
-                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.e.insert(ctx.e.begin(), call_frame);
                         ctx.c = *clo->closure.code;
                         if (clo->closure.constants) constants = *clo->closure.constants;
                         pc = 0;
@@ -2648,13 +2810,14 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                     Object* cont_val = (nargs > 0) ? ctx.s.back() : nullptr;
                     for (int i = 0; i < nargs; ++i) ctx.s.pop_back();
 
-                    ctx.s = *clo->continuation.s;
-                    ctx.s.push_back(cont_val);
-                    ctx.e = *clo->continuation.e;
-                    ctx.c = *clo->continuation.c;
-                    ctx.d = *clo->continuation.d;
-                    if (clo->continuation.constants) constants = *clo->continuation.constants;
-                    pc = 0;
+                    mark_continuation_use_or_throw(clo);
+                    trace_callcc_event("invoke-app-cont",
+                                       clo->continuation.id,
+                                       clo->continuation.s->size() + 1,
+                                       clo->continuation.e->size(),
+                                       clo->continuation.d->size(),
+                                       clo->continuation.c->size());
+                    throw ContinuationEscape{clo, cont_val};
                 }
                 break;
             }
@@ -2664,30 +2827,6 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 if (!ctx.s.empty()) {
                     Object* assigned = ctx.s.back();
                     set_lvar(ctx.e, i, j, assigned);
-
-                    // CALL/CALLG builds callee env by value-copying caller env.
-                    // For non-local mutation (i > 0), mirror the update into the
-                    // caller frame saved on dump so the write survives RTN restore.
-                    if (i > 0 && !ctx.d.empty()) {
-                        DumpFrame& caller = ctx.d.back();
-                        size_t caller_i = i - 1;
-                        if (caller_i < caller.e.size() && j < caller.e[caller_i].size()) {
-                            caller.e[caller_i][j] = assigned;
-                        }
-                    }
-
-                    // letrec は「先に nil を束縛してから set!」で初期化するため、
-                    // 値コピーで捕捉したクロージャ環境にも同じ更新を反映する。
-                    if (i < ctx.e.size() && j < ctx.e[i].size()) {
-                        for (Object* cell : ctx.e[i]) {
-                            if (!cell || cell->type != CLOSURE || !cell->closure.env) continue;
-                            if (i >= cell->closure.env->size()) continue;
-                            std::vector<Object*>& captured = (*cell->closure.env)[i];
-                            if (j < captured.size()) {
-                                captured[j] = assigned;
-                            }
-                        }
-                    }
                 }
                 break;
             }
@@ -2727,25 +2866,30 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                         Object* result = invoke_callable(clo, args);
                         ctx.s.push_back(result);
                     } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
                         if (cmd == CALL) {
                             ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
                             ctx.s.clear();
                         }
                         ctx.e = *clo->closure.env;
-                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.e.insert(ctx.e.begin(), call_frame);
                         ctx.c = *clo->closure.code;
                         if (clo->closure.constants) constants = *clo->closure.constants;
                         pc = 0;
                     }
                 } else if (clo->type == CONTINUATION) {
                     Object* cont_val = args.empty() ? nullptr : args[0];
-                    ctx.s = *clo->continuation.s;
-                    ctx.s.push_back(cont_val);
-                    ctx.e = *clo->continuation.e;
-                    ctx.c = *clo->continuation.c;
-                    ctx.d = *clo->continuation.d;
-                    if (clo->continuation.constants) constants = *clo->continuation.constants;
-                    pc = 0;
+                    mark_continuation_use_or_throw(clo);
+                    trace_callcc_event("invoke-call-cont",
+                                       clo->continuation.id,
+                                       clo->continuation.s->size() + 1,
+                                       clo->continuation.e->size(),
+                                       clo->continuation.d->size(),
+                                       clo->continuation.c->size());
+                    throw ContinuationEscape{clo, cont_val};
                 }
                 break;
             }
@@ -2782,25 +2926,30 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                         Object* result = invoke_callable(clo, args);
                         ctx.s.push_back(result);
                     } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
                         if (cmd == CALLG) {
                             ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
                             ctx.s.clear();
                         }
                         ctx.e = *clo->closure.env;
-                        ctx.e.insert(ctx.e.begin(), args);
+                        ctx.e.insert(ctx.e.begin(), call_frame);
                         ctx.c = *clo->closure.code;
                         if (clo->closure.constants) constants = *clo->closure.constants;
                         pc = 0;
                     }
                 } else if (clo->type == CONTINUATION) {
                     Object* cont_val = args.empty() ? nullptr : args[0];
-                    ctx.s = *clo->continuation.s;
-                    ctx.s.push_back(cont_val);
-                    ctx.e = *clo->continuation.e;
-                    ctx.c = *clo->continuation.c;
-                    ctx.d = *clo->continuation.d;
-                    if (clo->continuation.constants) constants = *clo->continuation.constants;
-                    pc = 0;
+                    mark_continuation_use_or_throw(clo);
+                    trace_callcc_event("invoke-callg-cont",
+                                       clo->continuation.id,
+                                       clo->continuation.s->size() + 1,
+                                       clo->continuation.e->size(),
+                                       clo->continuation.d->size(),
+                                       clo->continuation.c->size());
+                    throw ContinuationEscape{clo, cont_val};
                 } else {
                     throw VMError("attempt to call non-callable value: " + object_to_string(clo));
                 }
@@ -2889,7 +3038,13 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
             case RTN: {
                 if (ctx.d.empty()) goto end_vm;
                 if (ctx.s.empty()) {
-                    std::cerr << "[vm] ERROR: RTN: Empty stack on return" << std::endl;
+                    std::cerr << "[vm] ERROR: RTN: Empty stack on return"
+                              << " (e=" << ctx.e.size()
+                              << " d=" << ctx.d.size()
+                              << " c=" << ctx.c.size()
+                              << " last-cont=" << g_last_cont_restore_tag
+                              << "#" << g_last_cont_restore_id
+                              << ")" << std::endl;
                     return nullptr;
                 }
                 Object* ret = ctx.s.back();
@@ -2932,6 +3087,15 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 cont->continuation.c = new std::vector<int>(ctx.c.begin() + pc, ctx.c.end());
                 cont->continuation.d = new std::vector<DumpFrame>(ctx.d);
                 cont->continuation.constants = new std::vector<Object*>(constants);
+                cont->continuation.id = g_callcc_next_id++;
+                cont->continuation.vm_session_id = vm_owner_session_id;
+                cont->continuation.used = false;
+                trace_callcc_event("capture-callcc",
+                                   cont->continuation.id,
+                                   cont->continuation.s->size(),
+                                   cont->continuation.e->size(),
+                                   cont->continuation.d->size(),
+                                   cont->continuation.c->size());
 
                 std::vector<Object*> fn_args = {cont};
                 if (!fn) { ctx.s.push_back(nullptr); break; }
@@ -2941,30 +3105,59 @@ Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
                 } else if (fn->type == CLOSURE) {
                     ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
                     ctx.s.clear();
+                    std::vector<Object*> call_frame;
+                    if (!build_vm_call_frame(fn, fn_args, call_frame)) {
+                        return nullptr;
+                    }
                     ctx.e = *fn->closure.env;
-                    ctx.e.insert(ctx.e.begin(), fn_args);
+                    ctx.e.insert(ctx.e.begin(), call_frame);
                     ctx.c = *fn->closure.code;
                     if (fn->closure.constants) constants = *fn->closure.constants;
                     pc = 0;
                 } else if (fn->type == CONTINUATION) {
                     Object* cont_val = nullptr;
-                    ctx.s = *fn->continuation.s;
-                    ctx.s.push_back(cont_val);
-                    ctx.e = *fn->continuation.e;
-                    ctx.c = *fn->continuation.c;
-                    ctx.d = *fn->continuation.d;
-                    if (fn->continuation.constants) constants = *fn->continuation.constants;
-                    pc = 0;
+                    mark_continuation_use_or_throw(fn);
+                    trace_callcc_event("invoke-callcc-cont",
+                                       fn->continuation.id,
+                                       fn->continuation.s->size() + 1,
+                                       fn->continuation.e->size(),
+                                       fn->continuation.d->size(),
+                                       fn->continuation.c->size());
+                    throw ContinuationEscape{fn, cont_val};
                 }
                 break;
             }
             case STOP: goto end_vm;
             default: break;
         }
-    }
-    
-    } catch (const ContinuationEscape& esc) {
-        throw;  // re-throw for call/cc handling
+                }
+                break;
+            } catch (const ContinuationEscape& esc) {
+                if (esc.tag && esc.tag->type == CONTINUATION &&
+                    esc.tag->continuation.s && esc.tag->continuation.e &&
+                    esc.tag->continuation.c && esc.tag->continuation.d &&
+                    esc.tag->continuation.vm_session_id == vm_invocation_id) {
+                    Object* cont = esc.tag;
+                    trace_callcc_event("restore-vm-escape",
+                                       cont->continuation.id,
+                                       cont->continuation.s->size() + 1,
+                                       cont->continuation.e->size(),
+                                       cont->continuation.d->size(),
+                                       cont->continuation.c->size());
+                    record_last_cont_restore("restore-vm-escape", cont->continuation.id);
+                    ctx.s = *cont->continuation.s;
+                    ctx.s.push_back(esc.value);
+                    ctx.e = *cont->continuation.e;
+                    ctx.c = *cont->continuation.c;
+                    ctx.d = *cont->continuation.d;
+                    if (cont->continuation.constants) constants = *cont->continuation.constants;
+                    pc = 0;
+                    continue;
+                }
+                throw;
+            }
+        }
+
     } catch (const VMError& vme) {
         throw;
     } catch (const std::exception& e) {
@@ -4316,6 +4509,16 @@ void init_env(bool load_mlib = true) {
             }
         }
 
+        // Rebind for-each to a Scheme implementation so callback iteration
+        // remains continuation-safe under non-local jumps.
+        eval_from_source(
+            "(define for-each "
+            "  (lambda (proc ls) "
+            "    (let loop ((xs ls)) "
+            "      (if (null? xs) false "
+            "          (begin (proc (car xs)) (loop (cdr xs)))))))",
+            bootstrap_ctx, bootstrap_constants);
+
         g_active_ctx = prev_ctx;
         g_active_constants = prev_constants;
     }
@@ -4390,6 +4593,7 @@ int run_full_selftest() {
     expect_eq("(+ 100 (call/cc (lambda (k) (k 23))))", "123");
     expect_eq("(call/cc (lambda (k) 5))", "5");
     expect_eq("(+ 1 (call/cc (lambda (k) (k 41))))", "42");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", "222");
     // --- varargs ---
     expect_eq("((lambda x x) 1 2 3)", "(1 2 3)");
     expect_eq("((lambda (a b . r) r) 1 2 3 4)", "(3 4)");
@@ -4464,6 +4668,10 @@ int run_full_selftest() {
     expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
     expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
     expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(begin (define it (make-iter-lazy (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("make-iter-lazy-available", "true");
+    expect_eq("(begin (define cnt 0) (define it (make-iter-lazy (lambda (yield) (set! cnt (+ cnt 1)) (yield cnt) (set! cnt (+ cnt 1)) (yield cnt)))) (and (= cnt 0) (= (it) 1) (= cnt 1) (= (it) 2) (= cnt 2)))", "true");
+    expect_eq("(begin (define it0 (make-iter-lazy (lambda (yield) (yield 9)))) (list (it0) (it0)))", "(9 0)");
 
     if (failures == 0) {
         std::cout << "[selftest-full] all tests passed." << std::endl;
@@ -4520,11 +4728,155 @@ int run_mlib_utils_selftest() {
     expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
     expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
     expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(begin (define it (make-iter-lazy (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("make-iter-lazy-available", "true");
+    expect_eq("(begin (define cnt 0) (define it (make-iter-lazy (lambda (yield) (set! cnt (+ cnt 1)) (yield cnt) (set! cnt (+ cnt 1)) (yield cnt)))) (and (= cnt 0) (= (it) 1) (= cnt 1) (= (it) 2) (= cnt 2)))", "true");
+    expect_eq("(begin (define it0 (make-iter-lazy (lambda (yield) (yield 9)))) (list (it0) (it0)))", "(9 0)");
 
     if (failures == 0) {
         std::cout << "[selftest-mlib-utils] all tests passed." << std::endl;
     } else {
         std::cout << "[selftest-mlib-utils] " << failures << " test(s) FAILED." << std::endl;
+    }
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_callcc_selftest() {
+    init_env(true);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    int failures = 0;
+    auto expect_eq = [&](const std::string& expr, const std::string& expected) {
+        test_ctx.s.clear();
+        Object* result = eval_from_source(expr, test_ctx, constants);
+        std::string got;
+        if (!result) got = "nil";
+        else if (result->type == INT) got = (result->num ? (result->num == 1 && expected == "true" ? "true" : (result->num == 0 && expected == "false" ? "false" : std::to_string(result->num))) : "false");
+        else got = object_to_string(result);
+
+        if (result && result->type == INT) {
+            if (expected == "true" && result->num != 0) got = "true";
+            else if (expected == "false" && result->num == 0) got = "false";
+            else got = std::to_string(result->num);
+        }
+
+        if (got != expected) {
+            failures++;
+            std::cout << "[selftest-callcc][FAIL] " << expr
+                      << "  expected=" << expected << "  got=" << got << std::endl;
+        } else {
+            std::cout << "[selftest-callcc][PASS] " << expr << std::endl;
+        }
+    };
+
+    // ---- existing tests ----
+    expect_eq("(+ 100 (call/cc (lambda (k) (k 23))))", "123");
+    expect_eq("(call/cc (lambda (k) 5))", "5");
+    expect_eq("(+ 1 (call/cc (lambda (k) (k 41))))", "42");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", "222");
+    expect_eq("(begin (define it (make-iter-lazy (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 1)))) (if (= first 1) (saved 2) (if (= first 2) (saved 3) first))))", "3");
+
+    // ---- classic call/cc examples ----
+
+    // Ex1: basic escape -- call/cc used as early exit from a loop
+    // find-negative: return first negative number, or false if none
+    expect_eq(
+        "(begin"
+        "  (define find-negative"
+        "    (lambda (lst)"
+        "      (call/cc"
+        "        (lambda (exit)"
+        "          (let loop ((ls lst))"
+        "            (cond ((null? ls) false)"
+        "                  ((< (car ls) 0) (exit (car ls)))"
+        "                  (else (loop (cdr ls)))))))))"
+        "  (list (find-negative '(3 1 -5 2))"
+        "        (find-negative '(1 2 3))))",
+        "(-5 0)");  // false == 0
+
+    // Ex2: non-local exit from recursive search (member via call/cc)
+    expect_eq(
+        "(begin"
+        "  (define my-member"
+        "    (lambda (x lst)"
+        "      (call/cc"
+        "        (lambda (return)"
+        "          (letrec ((loop (lambda (ls)"
+        "                          (cond ((null? ls) false)"
+        "                                ((equal? (car ls) x) (return ls))"
+        "                                (else (loop (cdr ls)))))))"
+        "            (loop lst))))))"
+        "  (list (length (my-member 'b '(a b c d)))"
+        "        (my-member 'z '(a b c))))",
+        "(3 0)");  // (b c d) length=3; false=0
+
+    // Ex3: saved continuation re-invoked (counter)
+    // Each re-invocation sets val to cnt, increments cnt, loops until cnt>=4.
+    // Result: val when (>= cnt 4) first holds => cnt=4, val=3 (last saved call arg).
+    expect_eq(
+        "(let ((saved false) (cnt 0))"
+        "  (let ((val (call/cc (lambda (k) (set! saved k) 0))))"
+        "    (set! cnt (+ cnt 1))"
+        "    (if (< cnt 4)"
+        "        (saved cnt)"
+        "        val)))",
+        "3");
+
+    // Ex4: short-circuit product -- exit immediately on zero
+    expect_eq(
+        "(begin"
+        "  (define product"
+        "    (lambda (lst)"
+        "      (call/cc"
+        "        (lambda (exit)"
+        "          (let loop ((ls lst))"
+        "            (cond ((null? ls) 1)"
+        "                  ((= (car ls) 0) (exit 0))"
+        "                  (else (* (car ls) (loop (cdr ls))))))))))"
+        "  (list (product '(1 2 3 4))"
+        "        (product '(1 2 0 99))))",
+        "(24 0)");
+
+    // Ex5: multi-shot generator using call/cc (explicit yields, no for-each)
+    expect_eq(
+        "(begin"
+        "  (define gen"
+        "    (make-iter-lazy"
+        "      (lambda (yield)"
+        "        (yield 10)"
+        "        (yield 20)"
+        "        (yield 30))))"
+        "  (list (gen) (gen) (gen) (gen)))",
+        "(10 20 30 0)");
+
+    // Ex6: call/cc for exception-like early return from nested calls
+    expect_eq(
+        "(begin"
+        "  (define with-escape"
+        "    (lambda (thunk)"
+        "      (call/cc"
+        "        (lambda (escape)"
+        "          (thunk escape)))))"
+        "  (list"
+        "    (with-escape (lambda (e) (e 42) 999))"
+        "    (with-escape (lambda (e) (+ 1 (e 7) 999)))))",
+        "(42 7)");
+
+    if (failures == 0) {
+        std::cout << "[selftest-callcc] all tests passed." << std::endl;
+    } else {
+        std::cout << "[selftest-callcc] " << failures << " test(s) FAILED." << std::endl;
     }
 
     cleanup_heap();
@@ -4594,6 +4946,7 @@ int run_eval_selftest() {
         {"(begin (define-macro (id x) x) (id 7))", 7},
         {"(begin (define q `(1 ,(+ 1 2) 4)) (car (cdr q)))", 3},
         {"(call/cc (lambda (k) (k 9) 5))", 9},
+        {"(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", 222},
         // new parity cases
         {"(/ 10 2)", 5},
         {"(modulo 10 3)", 1},
@@ -4640,7 +4993,9 @@ int run_eval_selftest() {
         Object* result = eval_from_source(tc.expr, test_ctx, constants);
         bool used_vm = g_vm_subset_success_count > before_vm;
         if (used_vm) vm_used_cases++;
-        std::cout << "[selftest-eval][ROUTE] " << (used_vm ? "vm" : "evaluator") << " expr=" << tc.expr << std::endl;
+        if (g_trace_selftest_route) {
+            std::cout << "[selftest-eval][ROUTE] " << (used_vm ? "vm" : "evaluator") << " expr=" << tc.expr << std::endl;
+        }
         if (!result || result->type != INT || result->num != tc.expected_int) {
             failures++;
             std::cout << "[selftest-eval][FAIL] expr=" << tc.expr << " expected=" << tc.expected_int << " got=";
@@ -4804,6 +5159,7 @@ int run_compare_mlib_selftest() {
 //   --selftest-full  : mlib を含む総合テストを実行
 //   --selftest-mlib-compare : mlib あり/なしの結果差分を比較
 //   --selftest-mlib-utils   : mlib ユーティリティの回帰テストを実行
+//   --selftest-callcc       : call/cc 周辺の集中回帰テストを実行
 //   (引数なし)       : REPL を起動
 //
 // REPL ループ:
@@ -4816,6 +5172,20 @@ int main(int argc, char** argv) {
     if (const char* trace_env = std::getenv("MS_TRACE_LETREC")) {
         std::string v(trace_env);
         g_trace_letrec = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
+    }
+    if (const char* trace_callcc_env = std::getenv("MS_TRACE_CALLCC")) {
+        std::string v(trace_callcc_env);
+        g_trace_callcc = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
+    }
+    if (const char* trace_vm_env = std::getenv("MS_TRACE_VM_ALL")) {
+        std::string v(trace_vm_env);
+        if (!(v.empty() || v == "0" || v == "false" || v == "FALSE")) {
+            g_trace_vm_session = 1;
+        }
+    }
+    if (const char* trace_selftest_route_env = std::getenv("MS_TRACE_SELFTEST_ROUTE")) {
+        std::string v(trace_selftest_route_env);
+        g_trace_selftest_route = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
     }
 
     if (argc > 1 && std::string(argv[1]) == "--selftest") {
@@ -4832,6 +5202,9 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "--selftest-mlib-utils") {
         return run_mlib_utils_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-callcc") {
+        return run_callcc_selftest();
     }
 
     init_env();
