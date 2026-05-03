@@ -3,8 +3,8 @@ CXX = g++
 
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 
-TARGET = micro_scheme10
-SOURCES = micro_scheme10.cpp
+TARGET = micro_scheme11
+SOURCES = micro_scheme11.cpp
 
 all: $(TARGET)
 
