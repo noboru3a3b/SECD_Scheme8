@@ -1,0 +1,5245 @@
+﻿
+// ============================================================
+// micro_scheme9.cpp
+// SECD 仮想マシンベースの Micro Scheme インタプリタ / コンパイラ
+// micro_scheme8.cpp ベース + ベクタ型 (VECTOR) 追加
+//
+// 構成概要:
+//   1. オブジェクト定義        (Object, Type, DumpFrame, VMContext)
+//   2. ヒープ・GC              (alloc, mark, sweep, gc)
+//   3. ユーティリティ          (cons, make_int, get_symbol, print_*)
+//   4. バイトコード命令定数     (OP_LD, OP_LDC, ...)
+//   5. コンパイラ              (compile_subset_expr)
+//   6. VM                     (vm)
+//   7. トークナイザ・リーダ    (tokenize, s_read)
+//   8. 評価器                 (eval_expr, eval_from_source)
+//   9. プリミティブ登録        (register_core_primitives)
+//  10. 初期化・REPL            (init_env, main)
+//
+// ベクタ追加点:
+//   - Type 列挙に VECTOR 追加
+//   - Object union に vec (std::vector<Object*>*) 追加
+//   - GC mark/sweep でベクタ要素を追跡
+//   - #(...) リテラル読み取り対応 (トークン TOK_HASH_LPAREN)
+//   - プリミティブ: make-vector vector vector? vector-ref vector-set!
+//                   vector-length vector->list list->vector
+//                   vector-fill! vector-copy vector-sort vector-sort!
+// ============================================================
+#include <iostream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <functional>
+#include <memory>
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+// ------------------------------------------------------------
+// SECD マシンのフレーム構造
+// DumpFrame: 関数呼び出し時に保存するフレーム一式
+//   s: スタックの中身, e: 環境, c: 続きのコード列, constants: 定数プール
+// VMContext: 実行中の SECD レジスタ
+//   s: スタック (S), e: 環境 (E), c: コード列 (C), d: ダンプ (D)
+// ------------------------------------------------------------
+struct Object;
+struct DumpFrame {
+    std::vector<Object*> s;               // 保存されたスタック
+    std::vector<std::vector<Object*>> e;  // 保存された環境
+    std::vector<int> c;                   // 保存されたコード列
+    std::vector<Object*> constants;       // 保存された定数プール
+};
+struct VMContext {
+    std::vector<Object*> s;               // S: スタック
+    std::vector<std::vector<Object*>> e;  // E: 環境（フレームのリスト）
+    std::vector<int> c;                   // C: バイトコード列（インデックスで参照）
+    std::vector<DumpFrame> d;             // D: ダンプ（呼び出しスタック）
+};
+
+// ------------------------------------------------------------
+// オブジェクト型の列挙
+//   INT         : 32bit 整数
+//   INT64       : 64bit 整数（オーバーフロー時に自動昇格）
+//   DOUBLE      : 浮動小数点数（さらなるオーバーフロー時に昇格）
+//   SYMBOL      : シンボル（識別子・キーワード）
+//   STRING      : 文字列
+//   PAIR        : cons セル（リストの基本構成要素）
+//   CLOSURE     : クロージャ（コード + キャプチャされた環境）
+//   CONTINUATION: 継続（call/cc で捕捉した実行コンテキスト）
+//   PRIMITIVE   : C++ で実装した組み込み関数
+//   PORT        : ファイルポート（入出力）
+//   UNDEF       : 未定義値
+// ------------------------------------------------------------
+enum Type { INT, INT64, DOUBLE, SYMBOL, STRING, PAIR, CLOSURE, CONTINUATION, PRIMITIVE, PORT, UNDEF, VECTOR };
+
+extern size_t g_vector_slot_count;
+
+// ------------------------------------------------------------
+// Object: ヒープ上のすべての Scheme 値を表す統一構造体
+//   type   : 上記 Type 列挙値
+//   marked : GC マーク（mark & sweep で使用）
+//   union  : 型ごとのペイロード
+// ------------------------------------------------------------
+struct Object {
+    Type type;
+    bool marked = false;
+    union {
+        int num;
+        long long num64;
+        long double dbl;
+        std::string* sym;
+        std::string* str;
+        struct { Object* car; Object* cdr; } pair;
+        struct {
+            std::vector<int>* code;
+            std::vector<std::vector<Object*>>* env;
+            std::vector<Object*>* constants;
+            int vm_fixed_arity;
+            bool vm_has_rest;
+        } closure;
+        struct {
+            std::fstream* file;
+            bool is_output;
+        } port;
+        struct { 
+            std::vector<Object*>* s; std::vector<std::vector<Object*>>* e;
+            std::vector<int>* c; std::vector<DumpFrame>* d;
+            std::vector<Object*>* constants;
+            unsigned long long id;
+        } continuation;
+        std::function<Object*(std::vector<Object*>&)>* prim;
+        std::vector<Object*>* vec;  // VECTOR type: ヒープ上要素の配列
+    };
+
+    Object(Type t) : type(t), marked(false) {
+        if (t == INT) num = 0;
+        else if (t == INT64) num64 = 0;
+        else if (t == DOUBLE) dbl = 0.0L;
+        else if (t == SYMBOL) sym = nullptr;
+        else if (t == STRING) str = nullptr;
+        else if (t == PAIR) { pair.car = nullptr; pair.cdr = nullptr; }
+        else if (t == CLOSURE) { closure.code = nullptr; closure.env = nullptr; closure.constants = nullptr; closure.vm_fixed_arity = 0; closure.vm_has_rest = false; }
+        else if (t == PORT) { port.file = nullptr; port.is_output = false; }
+        else if (t == CONTINUATION) { continuation.s = nullptr; continuation.e = nullptr; 
+                                     continuation.c = nullptr; continuation.d = nullptr; continuation.constants = nullptr; continuation.id = 0; }
+        else if (t == PRIMITIVE) prim = nullptr;
+        else if (t == VECTOR) vec = nullptr;
+    }
+
+    ~Object() {
+        if (type == SYMBOL) delete sym;
+        else if (type == STRING) delete str;
+        else if (type == CLOSURE) { delete closure.code; delete closure.env; delete closure.constants; }
+        else if (type == PORT) {
+            if (port.file) {
+                if (port.file->is_open()) port.file->close();
+                delete port.file;
+            }
+        }
+        else if (type == CONTINUATION) { 
+            delete continuation.s; delete continuation.e; 
+            delete continuation.c; delete continuation.d; delete continuation.constants;
+        }
+        else if (type == PRIMITIVE) delete prim;
+        else if (type == VECTOR) {
+            if (vec) g_vector_slot_count -= vec->size();
+            delete vec;
+        }
+    }
+};
+
+// ------------------------------------------------------------
+// グローバル状態
+//   heap             : GC 管理対象のすべてのオブジェクトポインタ
+//   globals          : 大域変数テーブル（シンボル名 → Object*）
+//   macros           : マクロテーブル（シンボル名 → クロージャ）
+//   symbols          : シンボルインターン表（同名は同一オブジェクトを共有）
+//   int_cache        : 小整数キャッシュ（再確保を避ける最適化）
+//   g_eval_env_stack : ツリーウォーク評価器のレキシカル環境スタック
+//   g_closure_lexenv : eval 系クロージャのキャプチャ環境
+//   MAX_OBJECTS      : GC を起動するヒープサイズの閾値
+//   SMALL_INT_MIN/MAX: キャッシュ対象の整数範囲
+//   g_active_ctx     : 現在実行中の VMContext（alloc から GC を呼ぶため）
+//   g_active_constants: 現在実行中の定数プール（GC のルート走査に使用）
+// ------------------------------------------------------------
+std::vector<Object*> heap;
+std::unordered_map<std::string, Object*> globals;
+std::unordered_map<std::string, Object*> macros;
+std::unordered_map<std::string, Object*> symbols;
+std::unordered_map<int, Object*> int_cache;
+using EvalFrame = std::unordered_map<std::string, Object*>;
+using EvalEnv = std::vector<EvalFrame>;
+std::vector<EvalFrame> g_eval_env_stack;
+std::unordered_map<Object*, EvalEnv> g_closure_lexenv;
+std::vector<Object*> g_temp_gc_roots;
+int g_vm_subset_success_count = 0;
+int g_vm_subset_failure_count = 0;
+bool g_trace_letrec = false;
+bool g_trace_callcc = false;
+bool g_trace_selftest_route = false;
+bool g_disable_vm_fast_path = false;
+int g_trace_vm_session = 0;
+long long g_do_loop_counter = 0;
+unsigned long long g_callcc_next_id = 1;
+unsigned long long g_vm_invocation_next_id = 1;
+unsigned long long g_last_cont_restore_id = 0;
+std::string g_last_cont_restore_tag;
+thread_local int g_vm_call_depth = 0;
+thread_local std::vector<unsigned long long> g_vm_invocation_stack;
+const size_t MAX_OBJECTS = 1000000;  // この件数を超えたら GC を発動
+const size_t MAX_VM_STEPS = 100000000; // VM 実行ステップ上限
+const size_t GC_WARN_HEAP_HIGH_PERCENT = 95;   // GC 後 heap が上限の 95% 以上
+const size_t GC_WARN_LOW_COLLECT_PERCENT = 1;  // 回収率 1% 以下を低回収とみなす
+const size_t GC_WARN_PRESSURE_STREAK = 8;      // 低回収 + 高水位 が連続したら警告
+const size_t GC_WARN_LEXENV_STREAK = 4;        // lexenv 増加が連続したら警告
+const int SMALL_INT_MIN = -1024;   // 整数キャッシュの下限
+const int SMALL_INT_MAX = 4096;    // 整数キャッシュの上限
+
+size_t g_gc_pressure_streak = 0;
+size_t g_gc_lexenv_growth_streak = 0;
+size_t g_gc_prev_lexenv_size = 0;  // 前回 GC 後の g_closure_lexenv サイズ（連続増加判定用）
+size_t g_vector_slot_count = 0;    // VECTOR 内の総要素数（O(1) の実効ヒープ重み用）
+
+VMContext* g_active_ctx = nullptr;             // alloc 時に参照する実行コンテキスト
+std::vector<Object*>* g_active_constants = nullptr; // alloc 時に参照する定数プール
+
+Object* vm(VMContext& ctx, std::vector<Object*>& constants);
+Object* eval_expr(Object* expr);
+Object* eval_from_source(const std::string& source, VMContext& ctx, std::vector<Object*>& constants);
+std::vector<Object*> read_all_exprs_from_string(const std::string& text);
+bool load_scheme_file(const std::string& path);
+Object* prim_read_impl(std::vector<Object*>& args);
+static size_t effective_heap_weight();
+Object* macro_expand_1(Object* expr);
+Object* macro_expand(Object* expr);
+static bool contains_macro_call(Object* expr);
+static void trace_callcc_event(const std::string& tag, unsigned long long id,
+                               size_t s, size_t e, size_t d, size_t c) {
+    if (!g_trace_callcc) return;
+    std::cerr << "[trace-callcc] " << tag
+              << " id=" << id
+              << " s=" << s
+              << " e=" << e
+              << " d=" << d
+              << " c=" << c
+              << std::endl;
+}
+
+static void record_last_cont_restore(const std::string& tag, unsigned long long id) {
+    g_last_cont_restore_tag = tag;
+    g_last_cont_restore_id = id;
+}
+
+static bool restore_continuation_state(VMContext& ctx,
+                                       std::vector<Object*>& constants,
+                                       Object* cont_obj,
+                                       Object* value,
+                                       const std::string& trace_tag,
+                                       bool record_restore = false) {
+    if (!cont_obj || cont_obj->type != CONTINUATION ||
+        !cont_obj->continuation.s || !cont_obj->continuation.e ||
+        !cont_obj->continuation.c || !cont_obj->continuation.d) {
+        return false;
+    }
+
+    trace_callcc_event(trace_tag,
+                       cont_obj->continuation.id,
+                       cont_obj->continuation.s->size() + 1,
+                       cont_obj->continuation.e->size(),
+                       cont_obj->continuation.d->size(),
+                       cont_obj->continuation.c->size());
+    if (record_restore) {
+        record_last_cont_restore(trace_tag, cont_obj->continuation.id);
+    }
+
+    ctx.s = *cont_obj->continuation.s;
+    ctx.s.push_back(value);
+    ctx.e = *cont_obj->continuation.e;
+    ctx.c = *cont_obj->continuation.c;
+    ctx.d = *cont_obj->continuation.d;
+    if (cont_obj->continuation.constants) {
+        constants = *cont_obj->continuation.constants;
+    }
+    return true;
+}
+
+struct ParseError : public std::runtime_error {
+    explicit ParseError(const std::string& msg) : std::runtime_error(msg) {}
+};
+struct VMError : public std::runtime_error {
+    explicit VMError(const std::string& msg) : std::runtime_error(msg) {}
+};
+
+struct ContinuationEscape : public std::exception {
+    Object* tag;
+    Object* value;
+    ContinuationEscape(Object* t, Object* v) : tag(t), value(v) {}
+    const char* what() const noexcept override { return "continuation escape"; }
+};
+
+// ------------------------------------------------------------
+// EvalEnvGuard
+//   g_eval_env_stack の RAII リストア用ガード。
+//   コンストラクタでスタックを snapshot し、デストラクタで必ず戻す。
+//   例外・早期 return のどちらでも env が残留しない。
+//   使い方:
+//     EvalEnvGuard _guard(g_eval_env_stack);       // 全体スナップショット
+//     EvalEnvGuard _guard(g_eval_env_stack, true); // push_back 1フレーム分だけ守る
+// ------------------------------------------------------------
+struct EvalEnvGuard {
+    std::vector<EvalFrame>& stack;
+    std::vector<EvalFrame> saved;
+
+    // フルスナップショット：restore 時に saved で完全上書き
+    explicit EvalEnvGuard(std::vector<EvalFrame>& s)
+        : stack(s), saved(s) {}
+
+    // push ガード：restore 時に saved サイズまで切り詰める（pop_back の代替）
+    EvalEnvGuard(std::vector<EvalFrame>& s, bool /*pop_mode*/)
+        : stack(s), saved() { saved.resize(s.size()); /* size だけ記録 */ }
+
+    ~EvalEnvGuard() {
+        if (saved.empty()) {
+            // pop ガード：元のサイズより増えたフレームを除去
+            // (saved が空なのは pop_mode の証)
+            // → ただし本実装では size を別フィールドで持つ方が明確なので
+            //   フルスナップショット方式に統一する
+        }
+        stack = saved;
+    }
+
+    // 明示的に解除（正常終了時は restore 不要な箇所向け）
+    // ※ 本 codebase では正常時も restore するので通常は不要
+};
+
+// pop_back 1フレーム専用ガード（let/letrec 向け・軽量）
+struct EvalFramePushGuard {
+    std::vector<EvalFrame>& stack;
+    bool active = true;
+    explicit EvalFramePushGuard(std::vector<EvalFrame>& s) : stack(s) {
+        stack.push_back(EvalFrame{});
+    }
+    ~EvalFramePushGuard() {
+        if (active && !stack.empty()) stack.pop_back();
+    }
+    void release() { active = false; } // 手動 pop した後に呼ぶ
+};
+
+struct ParamSpec {
+    std::vector<std::string> fixed;
+    bool has_rest = false;
+    std::string rest;
+};
+
+// --- 追加する前方宣言 ---
+Object* vector_to_pair(const std::vector<Object*>& items);
+bool is_symbol_name(Object* obj, const std::string& name);
+Object* backquote_transfer(Object* expr);
+bool parse_binding_list(Object* bindings_expr, std::vector<std::pair<std::string, Object*>>& out);
+bool is_tagged_form(Object* obj, const std::string& tag);
+bool should_trace_letrec_expr(Object* expr);
+void trace_letrec_expr(const std::string& tag, Object* expr);
+// ------------------------
+
+bool extract_param_spec(Object* params_expr, ParamSpec& out) {
+    out = ParamSpec{};
+    std::unordered_set<std::string> seen;
+
+    if (!params_expr) {
+        return true;
+    }
+
+    if (params_expr->type == SYMBOL && params_expr->sym) {
+        out.has_rest = true;
+        out.rest = *params_expr->sym;
+        return true;
+    }
+
+    Object* cur = params_expr;
+    while (cur && cur->type == PAIR) {
+        Object* p = cur->pair.car;
+        if (!p || p->type != SYMBOL || !p->sym) {
+            return false;
+        }
+        const std::string& name = *p->sym;
+        if (seen.count(name) > 0) return false;
+        seen.insert(name);
+        out.fixed.push_back(name);
+        cur = cur->pair.cdr;
+    }
+
+    if (cur) {
+        if (cur->type != SYMBOL || !cur->sym) return false;
+        if (seen.count(*cur->sym) > 0) return false;
+        out.has_rest = true;
+        out.rest = *cur->sym;
+    }
+
+    return true;
+}
+
+bool extract_param_names(Object* params_expr, std::vector<std::string>& out) {
+    ParamSpec spec;
+    if (!extract_param_spec(params_expr, spec) || spec.has_rest) {
+        return false;
+    }
+    out = spec.fixed;
+    return true;
+}
+
+bool bind_params_to_globals(const ParamSpec& spec, const std::vector<Object*>& args,
+                            std::unordered_map<std::string, Object*>& saved,
+                            std::vector<std::string>& new_bindings) {
+    if (!spec.has_rest && spec.fixed.size() != args.size()) return false;
+    if (spec.has_rest && args.size() < spec.fixed.size()) return false;
+
+    auto bind_one = [&](const std::string& name, Object* value) {
+        auto it = globals.find(name);
+        if (it != globals.end()) {
+            saved[name] = it->second;
+        } else {
+            new_bindings.push_back(name);
+        }
+        globals[name] = value;
+    };
+
+    for (size_t i = 0; i < spec.fixed.size(); ++i) {
+        bind_one(spec.fixed[i], args[i]);
+    }
+
+    if (spec.has_rest) {
+        std::vector<Object*> rest_items(args.begin() + static_cast<long long>(spec.fixed.size()), args.end());
+        bind_one(spec.rest, vector_to_pair(rest_items));
+    }
+
+    return true;
+}
+
+Object* bool_obj(bool v) {
+    return v ? globals["true"] : globals["false"];
+}
+
+bool is_true(Object* v) {
+    return v != globals["false"];
+}
+
+bool objects_equal(Object* a, Object* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->type != b->type) return false;
+    if (a->type == INT) return a->num == b->num;
+    if (a->type == SYMBOL && a->sym && b->sym) return *a->sym == *b->sym;
+    if (a->type == STRING && a->str && b->str) return *a->str == *b->str;
+    if (a->type == PAIR) {
+        return objects_equal(a->pair.car, b->pair.car) && objects_equal(a->pair.cdr, b->pair.cdr);
+    }
+    if (a->type == VECTOR) {
+        if (!a->vec || !b->vec) return a->vec == b->vec;
+        if (a->vec->size() != b->vec->size()) return false;
+        for (size_t i = 0; i < a->vec->size(); ++i) {
+            if (!objects_equal((*a->vec)[i], (*b->vec)[i])) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+
+// ------------------------------------------------------------
+// GC: マーク & スイープ方式
+//
+// mark(obj)  : obj を起点に到達可能な全オブジェクトに marked フラグを立てる
+// sweep()    : marked でないオブジェクトを delete して heap から除去する
+// gc(ctx, constants, silent)
+//            : ルート集合（スタック・環境・グローバル変数等）から
+//              mark を呼び出し、sweep で不要オブジェクトを回収する
+//              silent=true のときは [GC] メッセージを出力しない
+// alloc(t)   : heap が MAX_OBJECTS に達したら gc を発動してから確保する
+// ------------------------------------------------------------
+void mark(Object* obj) {
+    if (!obj || obj->marked) return;
+    obj->marked = true;
+
+    if (obj->type == PAIR) {
+        mark(obj->pair.car);
+        mark(obj->pair.cdr);
+    } else if (obj->type == CLOSURE) {
+        if (obj->closure.env) {
+            for (auto& frame : *obj->closure.env) {
+                for (auto& item : frame) mark(item);
+            }
+        }
+        if (obj->closure.constants) {
+            for (auto& item : *obj->closure.constants) mark(item);
+        }
+    } else if (obj->type == CONTINUATION) {
+        if (obj->continuation.s) for (auto& item : *obj->continuation.s) mark(item);
+        if (obj->continuation.e) {
+            for (auto& frame : *obj->continuation.e) {
+                for (auto& item : frame) mark(item);
+            }
+        }
+        if (obj->continuation.d) {
+            for (auto& frame : *obj->continuation.d) {
+                for (auto& s_item : frame.s) mark(s_item);
+                for (auto& e_frame : frame.e) {
+                    for (auto& e_item : e_frame) mark(e_item);
+                }
+                for (auto& c_item : frame.constants) mark(c_item);
+            }
+        }
+        if (obj->continuation.constants) {
+            for (auto& item : *obj->continuation.constants) mark(item);
+        }
+    } else if (obj->type == VECTOR) {
+        if (obj->vec) {
+            for (auto& item : *obj->vec) mark(item);
+        }
+    }
+}
+
+size_t sweep(bool silent = false) {
+    auto it = std::remove_if(heap.begin(), heap.end(), [](Object* obj) {
+        if (obj->marked) {
+            obj->marked = false;
+            return false;
+        }
+        delete obj;
+        return true;
+    });
+    
+    size_t collected = std::distance(it, heap.end());
+    if (!silent && collected > 0) {
+        std::cout << "[GC] Collected " << collected << " objects."
+                  << "  heap=" << (heap.size() - collected)
+                  << "  lexenv=" << g_closure_lexenv.size()
+                  << std::endl;
+    }
+    heap.erase(it, heap.end());
+    return collected;
+}
+
+void gc(VMContext& ctx, std::vector<Object*>& constants, bool silent = false) {
+    for (auto& obj : ctx.s) mark(obj);
+    for (auto& frame : ctx.e) {
+        for (auto& obj : frame) mark(obj);
+    }
+    for (auto& obj : constants) mark(obj);
+    for (auto& pair : globals) mark(pair.second);
+    for (auto& pair : macros) mark(pair.second);
+    for (auto& pair : symbols) mark(pair.second);
+    for (auto& pair : int_cache) mark(pair.second);
+    for (auto& frame : g_eval_env_stack) {
+        for (auto& kv : frame) mark(kv.second);
+    }
+    for (auto& obj : g_temp_gc_roots) mark(obj);
+    for (auto& frame : ctx.d) {
+        for (auto& s_item : frame.s) mark(s_item);
+        for (auto& e_frame : frame.e) {
+            for (auto& e_item : e_frame) mark(e_item);
+        }
+        for (auto& c_item : frame.constants) mark(c_item);
+    }
+
+    // Prune dead closure keys before tracing captured lexical environments.
+    size_t lexenv_before = g_closure_lexenv.size();
+    for (auto it = g_closure_lexenv.begin(); it != g_closure_lexenv.end(); ) {
+        Object* clo = it->first;
+        if (!clo || clo->type != CLOSURE || !clo->marked) {
+            it = g_closure_lexenv.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    size_t lexenv_after = g_closure_lexenv.size();
+
+    for (auto& closure_env : g_closure_lexenv) {
+        for (auto& frame : closure_env.second) {
+            for (auto& kv : frame) mark(kv.second);
+        }
+    }
+
+    size_t collected = sweep(silent);
+    size_t heap_after = heap.size();
+    size_t heap_before = heap_after + collected;
+
+    // 前回 GC 後のサイズと比較して増加していれば streak を増やす
+    if (lexenv_after > g_gc_prev_lexenv_size) {
+        g_gc_lexenv_growth_streak++;
+    } else {
+        g_gc_lexenv_growth_streak = 0;
+    }
+    g_gc_prev_lexenv_size = lexenv_after;
+
+    bool heap_high = (heap_after * 100 >= MAX_OBJECTS * GC_WARN_HEAP_HIGH_PERCENT);
+    bool low_collection = (heap_before > 0) && (collected * 100 <= heap_before * GC_WARN_LOW_COLLECT_PERCENT);
+    if (heap_high && low_collection) {
+        g_gc_pressure_streak++;
+    } else {
+        g_gc_pressure_streak = 0;
+    }
+
+    // ベクタ要素込みの実効サイズを警告ログに記録（GC 後に 1 回だけ走査するので許容コスト）
+    size_t weight_after = effective_heap_weight();
+
+    if (!silent && g_gc_lexenv_growth_streak >= GC_WARN_LEXENV_STREAK) {
+        std::cout << "[GC-WARN] lexenv growth streak=" << g_gc_lexenv_growth_streak
+                  << "  lexenv=" << lexenv_before << "->" << lexenv_after
+                  << "  collected=" << collected
+                  << "  heap=" << heap_after << "(weight=" << weight_after << ")/" << MAX_OBJECTS
+                  << std::endl;
+    }
+
+    if (!silent && g_gc_pressure_streak >= GC_WARN_PRESSURE_STREAK) {
+        std::cout << "[GC-WARN] high heap pressure streak=" << g_gc_pressure_streak
+                  << "  collected=" << collected << "/" << heap_before
+                  << "  heap=" << heap_after << "(weight=" << weight_after << ")/" << MAX_OBJECTS
+                  << "  lexenv=" << lexenv_after
+                  << std::endl;
+    }
+}
+
+// heap 上の Object 数にベクタ要素数を加えた実効サイズを返す。
+// GC 後の診断ログ出力専用（alloc のたびに呼ぶと O(n²) になるため使わないこと）。
+static size_t effective_heap_weight() {
+    return heap.size() + g_vector_slot_count;
+}
+
+static void clear_transient_eval_state(VMContext* ctx = nullptr) {
+    g_eval_env_stack.clear();
+    if (ctx) ctx->s.clear();
+}
+
+static void set_vector_storage(Object* obj, std::vector<Object*>* storage) {
+    if (!obj || obj->type != VECTOR) return;
+    if (obj->vec) g_vector_slot_count -= obj->vec->size();
+    obj->vec = storage;
+    if (obj->vec) g_vector_slot_count += obj->vec->size();
+}
+
+Object* alloc(Type t) {
+    // heap.size() は O(1) のため毎回の alloc で呼んでも安全。
+    // effective_heap_weight() は O(n) なので alloc では使わない。
+    if (g_active_ctx && g_active_constants && heap.size() >= MAX_OBJECTS) {
+        gc(*g_active_ctx, *g_active_constants);
+    }
+    Object* obj = new Object(t);
+    heap.push_back(obj);
+    return obj;
+}
+
+// ------------------------------------------------------------
+// オーバーフロー検出関数
+//   32bit 整数の演算でオーバーフローが発生するかをチェック
+// ------------------------------------------------------------
+bool will_overflow_add(int a, int b) {
+    return (b > 0 && a > INT_MAX - b) || (b < 0 && a < INT_MIN - b);
+}
+
+bool will_overflow_sub(int a, int b) {
+    return (b < 0 && a > INT_MAX + b) || (b > 0 && a < INT_MIN + b);
+}
+
+bool will_overflow_mul(int a, int b) {
+    if (a == 0 || b == 0) return false;
+    long long res = (long long)a * b;
+    return res > INT_MAX || res < INT_MIN;
+}
+
+// Forward declaration: make_int, make_number, make_number_from_double
+Object* make_int(int val);
+Object* make_number(long long val);
+Object* make_number_from_double(long double val);
+
+// ------------------------------------------------------------
+// ユーティリティ: オブジェクト生成
+//   cons(car, cdr)  : PAIR オブジェクトを生成
+//   make_int(val)   : INT オブジェクトを生成（小整数はキャッシュから返す）
+//   get_symbol(str) : シンボルをインターンして返す（"nil" は nullptr）
+//   make_symbol_obj : インターンしない独立したシンボルを生成（主に read 用）
+// ------------------------------------------------------------
+Object* cons(Object* car, Object* cdr) {
+    Object* obj = alloc(PAIR);
+    obj->pair.car = car;
+    obj->pair.cdr = cdr;
+    return obj;
+}
+
+Object* make_int(int val) {
+    if (val >= SMALL_INT_MIN && val <= SMALL_INT_MAX) {
+        auto it = int_cache.find(val);
+        if (it != int_cache.end()) return it->second;
+        Object* obj = alloc(INT);
+        obj->num = val;
+        int_cache[val] = obj;
+        return obj;
+    }
+    Object* obj = alloc(INT);
+    obj->num = val;
+    return obj;
+}
+
+// 値に応じて適切な型に昇格させたオブジェクトを返す
+// 32bit に収まれば INT、64bit に収まれば INT64、それ以上は DOUBLE
+Object* make_number(long long val) {
+    if (val >= INT_MIN && val <= INT_MAX) {
+        return make_int((int)val);
+    }
+    Object* obj = alloc(INT64);
+    obj->num64 = val;
+    return obj;
+}
+
+Object* make_number_from_double(long double val) {
+    // 有限値か確認
+    if (!std::isfinite(val)) {
+        Object* obj = alloc(DOUBLE);
+        obj->dbl = val;
+        return obj;
+    }
+    
+    // 小数部を抽出（精度を考慮）
+    long double frac_part = val - floorl(val);
+    if (frac_part > 0.5L) frac_part = 1.0L - frac_part;  // 上への丸めの場合も考慮
+    
+    // 小数部がほぼ0ならば整数として扱う
+    const long double epsilon = 1e-15L;
+    if (fabsl(frac_part) < epsilon || (1.0L - fabsl(frac_part)) < epsilon) {
+        // llroundl は範囲外値に対して未定義/実装依存の結果になり得るため、
+        // 先に long long の範囲判定を行う。
+        if (val >= (long double)LLONG_MIN && val <= (long double)LLONG_MAX) {
+            long long as_ll = llroundl(val);  // 四捨五入で整数に変換
+
+            // INT に収まるか試す
+            if (as_ll >= INT_MIN && as_ll <= INT_MAX) {
+                return make_int((int)as_ll);
+            }
+            // INT64 に収まるか試す
+            return make_number(as_ll);
+        }
+    }
+    
+    // DOUBLE として保存
+    Object* obj = alloc(DOUBLE);
+    obj->dbl = val;
+    return obj;
+}
+
+Object* get_symbol(const std::string& str) {
+    if (str == "nil") return nullptr;
+    if (symbols.find(str) == symbols.end()) {
+        Object* obj = alloc(SYMBOL);
+        obj->sym = new std::string(str);
+        symbols[str] = obj;
+    }
+    return symbols[str];
+}
+
+Object* make_symbol_obj(const std::string& str) {
+    Object* obj = alloc(SYMBOL);
+    obj->sym = new std::string(str);
+    return obj;
+}
+
+Object* make_string_obj(const std::string& str) {
+    Object* obj = alloc(STRING);
+    obj->str = new std::string(str);
+    return obj;
+}
+
+void print_obj(Object* obj);
+void print_obj_stream(Object* obj, std::ostream& os);
+void print_code_stream(const std::vector<int>& code, std::ostream& os, const std::vector<Object*>* constants = nullptr);
+
+void print_list_inner_stream(Object* obj, std::ostream& os) {
+    if (!obj) return;
+    if (obj->type != PAIR) {
+        os << ". ";
+        print_obj_stream(obj, os);
+        return;
+    }
+    print_obj_stream(obj->pair.car, os);
+    if (obj->pair.cdr) {
+        os << " ";
+        print_list_inner_stream(obj->pair.cdr, os);
+    }
+}
+
+void print_obj_stream(Object* obj, std::ostream& os) {
+    if (!obj) { os << "nil"; return; }
+    switch (obj->type) {
+        case INT: os << obj->num; break;
+        case INT64: os << obj->num64; break;
+        case DOUBLE: os << obj->dbl; break;
+        case SYMBOL: os << *obj->sym; break;
+        case STRING: os << *obj->str; break;
+        case PAIR:
+            os << "(";
+            print_list_inner_stream(obj, os);
+            os << ")";
+            break;
+        case CLOSURE: {
+            os << "(CLOSURE ";
+            if (obj->closure.code && !obj->closure.code->empty()) {
+                // VM bytecode closure
+                print_code_stream(*obj->closure.code, os, obj->closure.constants);
+            } else if (obj->closure.constants && obj->closure.constants->size() >= 2) {
+                // Eval-closure: print (ARGS params body...) format - simplified to avoid traversal issues
+                os << "(ARGS ";
+                if ((*obj->closure.constants)[0]) {
+                    print_obj_stream((*obj->closure.constants)[0], os);
+                } else {
+                    os << "()";
+                }
+                os << " ...)";
+            } else {
+                os << "()";
+            }
+            os << " NIL)";  // Simplified: always show NIL for environment to avoid traversal
+            break;
+        }
+        case PRIMITIVE: {
+            // Try to find the name of the primitive by searching globals
+            std::string prim_name;
+            for (const auto& kv : globals) {
+                if (kv.second == obj) {
+                    prim_name = kv.first;
+                    break;
+                }
+            }
+            if (prim_name.empty()) {
+                os << "(PRIMITIVE #<FUNCTION>)";
+            } else {
+                os << "(PRIMITIVE #<FUNCTION " << prim_name << ">)";
+            }
+            break;
+        }
+        case CONTINUATION:
+            os << "#<continuation>";
+            break;
+        case UNDEF:
+            os << "#<undef>";
+            break;
+        case PORT:
+            os << (obj->port.is_output ? "<port:output>" : "<port:input>");
+            break;
+        case VECTOR: {
+            os << "#(";
+            if (obj->vec) {
+                for (size_t i = 0; i < obj->vec->size(); ++i) {
+                    if (i > 0) os << " ";
+                    print_obj_stream((*obj->vec)[i], os);
+                }
+            }
+            os << ")";
+            break;
+        }
+        default: os << "<obj>"; break;
+    }
+}
+
+void print_obj(Object* obj) {
+    print_obj_stream(obj, std::cout);
+}
+
+std::string object_to_string(Object* obj) {
+    std::ostringstream oss;
+    print_obj_stream(obj, oss);
+    return oss.str();
+}
+
+bool contains_symbol_in_tree(Object* expr, const std::string& name) {
+    if (!expr) return false;
+    if (expr->type == SYMBOL && expr->sym) {
+        return *expr->sym == name;
+    }
+    if (expr->type == PAIR) {
+        return contains_symbol_in_tree(expr->pair.car, name) || contains_symbol_in_tree(expr->pair.cdr, name);
+    }
+    return false;
+}
+
+bool is_named_let_form(Object* expr) {
+    if (!expr || expr->type != PAIR) return false;
+    Object* head = expr->pair.car;
+    if (!is_symbol_name(head, "let")) return false;
+    Object* rest = expr->pair.cdr;
+    if (!rest || rest->type != PAIR) return false;
+    Object* maybe_name = rest->pair.car;
+    return maybe_name && maybe_name->type == SYMBOL && maybe_name->sym;
+}
+
+bool should_trace_letrec_expr(Object* expr) {
+    return contains_symbol_in_tree(expr, "letrec") || is_named_let_form(expr);
+}
+
+void trace_letrec_expr(const std::string& tag, Object* expr) {
+    if (!g_trace_letrec) return;
+    std::cerr << "[trace-letrec] " << tag << " " << object_to_string(expr) << std::endl;
+}
+
+// ------------------------------------------------------------
+// バイトコード命令定数
+//
+// ロード系:
+//   OP_LD    (0)  : LD (i j)  - 環境フレーム i の j 番目の変数をスタックへ
+//   OP_LDC   (1)  : LDC idx   - 定数プール[idx] をスタックへ
+//   OP_LDG   (2)  : LDG idx   - 定数プール[idx] のシンボル名の大域変数をスタックへ
+//   OP_LDF   (3)  : LDF idx   - 定数プール[idx] のコードからクロージャを生成してスタックへ
+//   OP_LDCT  (4)  : LDCT      - call/cc 用継続を生成してスタックへ
+//   OP_LDNIL (20) : LDNIL     - nil をスタックへ
+//   OP_LDTRUE(21) : LDTRUE    - true をスタックへ
+//   OP_LDFALSE(22): LDFALSE   - false をスタックへ
+//
+// ストア系:
+//   OP_LSET  (5)  : LSET (i j) - スタックトップを環境フレーム i の j 番目へ格納
+//   OP_GSET  (6)  : GSET idx   - スタックトップを大域変数へ格納
+//   OP_DEF  (13)  : DEF idx    - スタックトップを大域変数に定義（define）
+//   OP_DEFM (14)  : DEFM idx   - スタックトップをマクロとして定義（define-macro）
+//
+// 呼び出し系:
+//   OP_CALL  (16) : CALL n    - ダンプに継続を保存して n 引数でクロージャを呼び出す
+//   OP_TCALL (17) : TCALL n   - 末尾呼び出し。ダンプを保存せず既存フレームを再利用
+//   OP_CALLG (18) : CALLG idx n - 大域変数の関数を n 引数で呼び出す
+//   OP_TCALLG(19) : TCALLG idx n - 大域変数の末尾呼び出し
+//   OP_APP   (7)  : APP n     - 引数リスト版呼び出し（apply 系）
+//   OP_TAPP  (8)  : TAPP n   - 引数リスト版末尾呼び出し
+//   OP_CALLCC(33) : CALLCC   - call/cc：現在の継続を捕捉して関数を呼ぶ
+//
+// リターン・ジャンプ系:
+//   OP_RTN  (9)   : RTN       - ダンプからレジスタを復元して呼び出し元へ戻る
+//   OP_STOP (15)  : STOP      - VM 実行を停止
+//   OP_JZ   (31)  : JZ offset - スタックトップが false なら offset だけ PC を進める
+//   OP_JMP  (32)  : JMP offset- 無条件ジャンプ
+//   OP_POP  (10)  : POP       - スタックトップを破棄
+//
+// 引数リスト構築:
+//   OP_ARGS    (11): ARGS n    - スタックから n 個を取り出してリストを作りスタックへ
+//   OP_ARGS_AP (12): ARGS-AP n - apply 用引数リスト構築
+// ------------------------------------------------------------
+constexpr int OP_LD = 0;
+constexpr int OP_LDC = 1;
+constexpr int OP_LDG = 2;
+constexpr int OP_LDF = 3;
+constexpr int OP_LDCT = 4;
+constexpr int OP_LSET = 5;
+constexpr int OP_GSET = 6;
+constexpr int OP_APP = 7;
+constexpr int OP_TAPP = 8;
+constexpr int OP_ARGS = 11;
+constexpr int OP_ARGS_AP = 12;
+constexpr int OP_DEF = 13;
+constexpr int OP_DEFM = 14;
+constexpr int OP_STOP = 15;
+constexpr int OP_RTN = 9;
+constexpr int OP_CALL = 16;
+constexpr int OP_TCALL = 17;
+constexpr int OP_CALLG = 18;
+constexpr int OP_TCALLG = 19;
+constexpr int OP_LDNIL = 20;
+constexpr int OP_LDTRUE = 21;
+constexpr int OP_LDFALSE = 22;
+constexpr int OP_JZ = 31;
+constexpr int OP_JMP = 32;
+constexpr int OP_CALLCC = 33;
+constexpr int OP_POP = 10;
+
+std::string op_to_string(int op) {
+    switch (op) {
+        case OP_LD: return "LD";
+        case OP_LDC: return "LDC";
+        case OP_LDG: return "LDG";
+        case OP_LDF: return "LDF";
+        case OP_LDCT: return "LDCT";
+        case OP_LSET: return "LSET";
+        case OP_GSET: return "GSET";
+        case OP_APP: return "APP";
+        case OP_TAPP: return "TAPP";
+        case OP_ARGS: return "ARGS";
+        case OP_ARGS_AP: return "ARGS-AP";
+        case OP_DEF: return "DEF";
+        case OP_DEFM: return "DEFM";
+        case OP_STOP: return "STOP";
+        case OP_RTN: return "RTN";
+        case OP_CALL: return "CALL";
+        case OP_TCALL: return "TCALL";
+        case OP_CALLG: return "CALLG";
+        case OP_TCALLG: return "TCALLG";
+        case OP_LDNIL: return "LDNIL";
+        case OP_LDTRUE: return "LDTRUE";
+        case OP_LDFALSE: return "LDFALSE";
+        case OP_JZ: return "JZ";
+        case OP_JMP: return "JMP";
+        case OP_CALLCC: return "CALLCC";
+        case OP_POP: return "POP";
+        default: return "UNKNOWN";
+    }
+}
+
+void print_code_stream(const std::vector<int>& code, std::ostream& os, const std::vector<Object*>* constants) {
+    if (code.empty()) { os << "()"; return; }
+
+    auto print_const = [&](int idx) {
+        if (constants && idx >= 0 && static_cast<size_t>(idx) < constants->size()) {
+            print_obj_stream((*constants)[static_cast<size_t>(idx)], os);
+        } else {
+            os << idx;
+        }
+    };
+
+    os << "(";
+    for (size_t i = 0; i < code.size(); ) {
+        int op = code[i];
+        if (i > 0) os << " ";
+        os << op_to_string(op);
+        i++;
+        
+        if (op == OP_LD && i + 1 < code.size()) {
+            int d = code[i];
+            int v = code[i+1];
+            os << " (" << d << " . " << v << ")";
+            i += 2;
+        } else if (op == OP_LDC && i < code.size()) {
+            int idx = code[i++];
+            os << " ";
+            print_const(idx);
+        } else if (op == OP_LDG && i < code.size()) {
+            int idx = code[i++];
+            os << " ";
+            print_const(idx);
+        } else if (op == OP_LDF && i < code.size()) {
+            int idx = code[i++];
+            os << " ";
+            if (constants && idx >= 0 && static_cast<size_t>(idx) < constants->size()) {
+                Object* nested = (*constants)[static_cast<size_t>(idx)];
+                if (nested && nested->type == CLOSURE && nested->closure.code) {
+                    print_code_stream(*nested->closure.code, os, constants);
+                } else {
+                    print_const(idx);
+                }
+            } else {
+                os << idx;
+            }
+        } else if (op == OP_LSET && i + 1 < code.size()) {
+            int d = code[i];
+            int v = code[i+1];
+            os << " (" << d << " . " << v << ")";
+            i += 2;
+        } else if ((op == OP_GSET || op == OP_DEF || op == OP_DEFM) && i < code.size()) {
+            int idx = code[i++];
+            os << " ";
+            print_const(idx);
+        } else if ((op == OP_APP || op == OP_TAPP || op == OP_CALL || op == OP_TCALL || op == OP_ARGS || op == OP_ARGS_AP) && i < code.size()) {
+            int num_args = code[i++];
+            os << " " << num_args;
+        } else if ((op == OP_CALLG || op == OP_TCALLG) && i + 1 < code.size()) {
+            int idx = code[i];
+            int num_args = code[i+1];
+            os << " ";
+            print_const(idx);
+            os << " " << num_args;
+            i += 2;
+        } else if (op == OP_JZ || op == OP_JMP) {
+            if (i < code.size()) {
+                int addr = code[i];
+                os << " " << addr;
+                i++;
+            }
+        }
+    }
+    os << ")";
+}
+
+static Object* make_lex_cell(Object* value) {
+    return cons(value, nullptr);
+}
+
+static Object* read_lex_slot(Object* slot) {
+    if (slot && slot->type == PAIR) return slot->pair.car;
+    return slot;
+}
+
+static void write_lex_slot(Object* slot, Object* value) {
+    if (slot && slot->type == PAIR) slot->pair.car = value;
+}
+
+Object* get_lvar(std::vector<std::vector<Object*>>& e, size_t i, size_t j) {
+    if (i < e.size() && j < e[i].size()) return read_lex_slot(e[i][j]);
+    return nullptr;
+}
+
+void set_lvar(std::vector<std::vector<Object*>>& e, size_t i, size_t j, Object* val) {
+    if (i < e.size() && j < e[i].size()) {
+        Object* slot = e[i][j];
+        if (slot && slot->type == PAIR) {
+            write_lex_slot(slot, val);
+        } else {
+            e[i][j] = make_lex_cell(val);
+        }
+    } else {
+        std::cerr << "VM Error: LVAR access out of range (" << i << ", " << j << ")" << std::endl;
+    }
+}
+
+std::vector<Object*> pair_to_vector(Object* lst) {
+    std::vector<Object*> out;
+    Object* cur = lst;
+    while (cur) {
+        if (cur->type != PAIR) {
+            break;
+        }
+        out.push_back(cur->pair.car);
+        cur = cur->pair.cdr;
+    }
+    return out;
+}
+
+Object* vector_to_pair(const std::vector<Object*>& items) {
+    size_t saved_roots = g_temp_gc_roots.size();
+    for (Object* item : items) g_temp_gc_roots.push_back(item);
+    // Keep the currently built list head alive across cons allocations.
+    size_t out_root_index = g_temp_gc_roots.size();
+    g_temp_gc_roots.push_back(nullptr);
+    Object* out = nullptr;
+    try {
+        for (auto it = items.rbegin(); it != items.rend(); ++it) {
+            g_temp_gc_roots[out_root_index] = out;
+            out = cons(*it, out);
+            g_temp_gc_roots[out_root_index] = out;
+        }
+    } catch (...) {
+        g_temp_gc_roots.resize(saved_roots);
+        throw;
+    }
+    g_temp_gc_roots.resize(saved_roots);
+    return out;
+}
+
+std::vector<int> resolve_clause_operand(int operand, const std::vector<Object*>& constants) {
+    size_t idx = static_cast<size_t>(operand);
+    if (idx < constants.size() && constants[idx] && constants[idx]->type == CLOSURE && constants[idx]->closure.code) {
+        return *constants[idx]->closure.code;
+    }
+    return {};
+}
+
+int add_constant(std::vector<Object*>& constants, Object* obj) {
+    constants.push_back(obj);
+    return static_cast<int>(constants.size() - 1);
+}
+
+using CompileEnv = std::vector<std::vector<std::string>>;
+
+bool find_local(const CompileEnv& env, const std::string& name, int& level, int& index) {
+    for (size_t i = 0; i < env.size(); ++i) {
+        const auto& frame = env[i];
+        for (size_t j = 0; j < frame.size(); ++j) {
+            if (frame[j] == name) {
+                level = static_cast<int>(i);
+                index = static_cast<int>(j);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+Object* make_vm_code_closure_constant(const std::vector<int>& body_code, const ParamSpec& spec) {
+    Object* clo = alloc(CLOSURE);
+    clo->closure.code = new std::vector<int>(body_code);
+    clo->closure.env = new std::vector<std::vector<Object*>>();
+    clo->closure.constants = new std::vector<Object*>();
+    clo->closure.vm_fixed_arity = static_cast<int>(spec.fixed.size());
+    clo->closure.vm_has_rest = spec.has_rest;
+    return clo;
+}
+
+bool build_vm_call_frame(Object* clo, const std::vector<Object*>& args, std::vector<Object*>& frame) {
+    if (!clo || clo->type != CLOSURE) return false;
+    int fixed_arity = clo->closure.vm_fixed_arity;
+    bool has_rest = clo->closure.vm_has_rest;
+    if ((!has_rest && static_cast<int>(args.size()) != fixed_arity) ||
+        (has_rest && static_cast<int>(args.size()) < fixed_arity)) {
+        return false;
+    }
+
+    size_t saved_roots = g_temp_gc_roots.size();
+    g_temp_gc_roots.push_back(clo);
+    for (Object* arg : args) g_temp_gc_roots.push_back(arg);
+
+    frame.clear();
+    frame.reserve(static_cast<size_t>(fixed_arity + (has_rest ? 1 : 0)));
+    try {
+        for (int i = 0; i < fixed_arity; ++i) {
+            Object* slot = make_lex_cell(args[static_cast<size_t>(i)]);
+            frame.push_back(slot);
+            g_temp_gc_roots.push_back(slot);
+        }
+        if (has_rest) {
+            std::vector<Object*> rest_items(args.begin() + fixed_arity, args.end());
+            Object* rest_list = vector_to_pair(rest_items);
+            g_temp_gc_roots.push_back(rest_list);
+            Object* rest_slot = make_lex_cell(rest_list);
+            frame.push_back(rest_slot);
+            g_temp_gc_roots.push_back(rest_slot);
+        }
+    } catch (...) {
+        g_temp_gc_roots.resize(saved_roots);
+        throw;
+    }
+
+    g_temp_gc_roots.resize(saved_roots);
+    return true;
+}
+
+// ------------------------------------------------------------
+// コンパイラ: compile_subset_expr
+//
+// Scheme 式 expr を SECD バイトコードに変換する。
+//
+// 引数:
+//   expr      : コンパイル対象の Scheme 式
+//   code      : 出力先バイトコード列（末尾に追記される）
+//   constants : 出力先定数プール（add_constant で追記）
+//   env       : コンパイル時のレキシカル環境（変数名 → (depth, index) 解決に使用）
+//   tail      : 末尾位置フラグ。true のとき CALL → TCALL、CALLG → TCALLG を発行する
+//
+// 末尾呼び出し最適化 (TCO):
+//   tail=true のとき、関数呼び出しは TCALL/TCALLG を発行する。
+//   TCALL/TCALLG はダンプにフレームを積まないため、深い再帰でも
+//   dump スタックが増加せず、定数空間で実行できる。
+//
+// 対応する構文:
+//   自己評価（整数・クロージャ等）, シンボル参照, quote, backquote,
+//   if, begin, lambda, define, define-macro, set!,
+//   let, let*, letrec, and, or, cond, when, unless, call/cc,
+//   一般関数呼び出し
+// ------------------------------------------------------------
+bool compile_subset_expr(Object* expr, std::vector<int>& code, std::vector<Object*>& constants, const CompileEnv& env, bool tail = false) {
+    if (!expr) {
+        code.push_back(OP_LDNIL);
+        return true;
+    }
+
+    if (expr->type == INT || expr->type == STRING || expr->type == PRIMITIVE || expr->type == CLOSURE || expr->type == CONTINUATION) {
+        code.push_back(OP_LDC);
+        code.push_back(add_constant(constants, expr));
+        return true;
+    }
+
+    if (expr->type == SYMBOL) {
+        if (!expr->sym) return false;
+        int level = 0;
+        int index = 0;
+        if (find_local(env, *expr->sym, level, index)) {
+            code.push_back(OP_LD);
+            code.push_back(level);
+            code.push_back(index);
+            return true;
+        }
+        auto git = globals.find(*expr->sym);
+        if (git == globals.end() && env.empty()) return false;
+        code.push_back(OP_LDG);
+        code.push_back(add_constant(constants, expr));
+        return true;
+    }
+
+    if (expr->type != PAIR) {
+        return false;
+    }
+
+    Object* head = expr->pair.car;
+    Object* rest = expr->pair.cdr;
+
+    if (is_symbol_name(head, "quote")) {
+        Object* quoted = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        code.push_back(OP_LDC);
+        code.push_back(add_constant(constants, quoted));
+        return true;
+    }
+
+    if (is_symbol_name(head, "backquote")) {
+        Object* arg = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        return compile_subset_expr(backquote_transfer(arg), code, constants, env);
+    }
+
+    if (is_symbol_name(head, "call/cc")) {
+        Object* fn_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        if (!compile_subset_expr(fn_expr, code, constants, env)) return false;
+        code.push_back(OP_CALLCC);
+        return true;
+    }
+
+    if (is_symbol_name(head, "if")) {
+        Object* test_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail1 = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* then_expr = (tail1 && tail1->type == PAIR) ? tail1->pair.car : nullptr;
+        Object* tail2 = (tail1 && tail1->type == PAIR) ? tail1->pair.cdr : nullptr;
+        Object* else_expr = (tail2 && tail2->type == PAIR) ? tail2->pair.car : nullptr;
+
+        if (!compile_subset_expr(test_expr, code, constants, env)) return false;
+
+        code.push_back(OP_JZ);
+        int jz_operand_index = static_cast<int>(code.size());
+        code.push_back(0);
+
+        if (!compile_subset_expr(then_expr, code, constants, env, tail)) return false;
+
+        code.push_back(OP_JMP);
+        int jmp_operand_index = static_cast<int>(code.size());
+        code.push_back(0);
+
+        int else_start = static_cast<int>(code.size());
+        if (else_expr) {
+            if (!compile_subset_expr(else_expr, code, constants, env, tail)) return false;
+        } else {
+            code.push_back(OP_LDNIL);
+        }
+        int end_pos = static_cast<int>(code.size());
+
+        code[jz_operand_index] = else_start - (jz_operand_index + 1);
+        code[jmp_operand_index] = end_pos - (jmp_operand_index + 1);
+        return true;
+    }
+
+    if (is_symbol_name(head, "begin")) {
+        std::vector<Object*> forms = pair_to_vector(rest);
+        if (forms.empty()) {
+            // (begin) -> :undef
+            code.push_back(OP_LDG);
+            code.push_back(add_constant(constants, get_symbol(":undef")));
+            return true;
+        }
+        for (size_t i = 0; i < forms.size(); ++i) {
+            bool is_last = (i + 1 == forms.size());
+            if (!compile_subset_expr(forms[i], code, constants, env, tail && is_last)) return false;
+            if (!is_last) {
+                code.push_back(OP_POP);
+            }
+        }
+        return true;
+    }
+
+    if (is_symbol_name(head, "lambda")) {
+        Object* params_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        ParamSpec spec;
+        if (!extract_param_spec(params_expr, spec)) return false;
+
+        CompileEnv body_env = env;
+        std::vector<std::string> param_frame = spec.fixed;
+        if (spec.has_rest) {
+            param_frame.push_back(spec.rest);
+        }
+        body_env.insert(body_env.begin(), std::move(param_frame));
+
+        std::vector<Object*> body_forms = pair_to_vector(body_list);
+        std::vector<int> body_code;
+        if (body_forms.empty()) {
+            body_code.push_back(OP_LDNIL);
+        } else {
+            for (size_t i = 0; i < body_forms.size(); ++i) {
+                bool is_last = (i + 1 == body_forms.size());
+                if (!compile_subset_expr(body_forms[i], body_code, constants, body_env, is_last)) return false;
+                if (!is_last) body_code.push_back(OP_POP);
+            }
+        }
+        body_code.push_back(OP_RTN);
+
+        Object* clo_const = make_vm_code_closure_constant(body_code, spec);
+        code.push_back(OP_LDF);
+        code.push_back(add_constant(constants, clo_const));
+        return true;
+    }
+
+    if (is_symbol_name(head, "define")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (!name_obj) return false;
+
+        if (name_obj->type == SYMBOL && name_obj->sym) {
+            Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+            if (!compile_subset_expr(val_expr, code, constants, env)) return false;
+            code.push_back(OP_DEF);
+            code.push_back(add_constant(constants, name_obj));
+            return true;
+        }
+
+        if (name_obj->type == PAIR && name_obj->pair.car && name_obj->pair.car->type == SYMBOL && name_obj->pair.car->sym) {
+            Object* fname = name_obj->pair.car;
+            Object* params_expr = name_obj->pair.cdr;
+            Object* body_list = tail;
+            Object* lambda_expr = cons(get_symbol("lambda"), cons(params_expr, body_list));
+            if (!compile_subset_expr(lambda_expr, code, constants, env)) return false;
+            code.push_back(OP_DEF);
+            code.push_back(add_constant(constants, fname));
+            return true;
+        }
+        return false;
+    }
+
+    if (is_symbol_name(head, "define-macro")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (!name_obj) return false;
+
+        if (name_obj->type == SYMBOL && name_obj->sym) {
+            Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+            if (!compile_subset_expr(val_expr, code, constants, env)) return false;
+            code.push_back(OP_DEFM);
+            code.push_back(add_constant(constants, name_obj));
+            return true;
+        }
+
+        if (name_obj->type == PAIR && name_obj->pair.car && name_obj->pair.car->type == SYMBOL && name_obj->pair.car->sym) {
+            Object* mname = name_obj->pair.car;
+            Object* params_expr = name_obj->pair.cdr;
+            Object* body_list = tail;
+            Object* lambda_expr = cons(get_symbol("lambda"), cons(params_expr, body_list));
+            if (!compile_subset_expr(lambda_expr, code, constants, env)) return false;
+            code.push_back(OP_DEFM);
+            code.push_back(add_constant(constants, mname));
+            return true;
+        }
+        return false;
+    }
+
+    if (is_symbol_name(head, "set!")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+        if (!name_obj || name_obj->type != SYMBOL || !name_obj->sym) return false;
+        if (!compile_subset_expr(val_expr, code, constants, env)) return false;
+        int level = 0;
+        int index = 0;
+        if (find_local(env, *name_obj->sym, level, index)) {
+            code.push_back(OP_LSET);
+            code.push_back(level);
+            code.push_back(index);
+        } else {
+            code.push_back(OP_GSET);
+            code.push_back(add_constant(constants, name_obj));
+        }
+        return true;
+    }
+
+    if (is_symbol_name(head, "let") || is_symbol_name(head, "let*") || is_symbol_name(head, "letrec")) {
+        Object* bindings_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+
+        // named let: (let name ((var init) ...) body...)
+        // -> (letrec ((name (lambda (vars...) body...))) (name inits...))
+        if (is_symbol_name(head, "let") && bindings_expr && bindings_expr->type == SYMBOL && bindings_expr->sym) {
+            std::string loop_name = *bindings_expr->sym;
+            Object* real_bindings = (body_list && body_list->type == PAIR) ? body_list->pair.car : nullptr;
+            Object* real_body = (body_list && body_list->type == PAIR) ? body_list->pair.cdr : nullptr;
+
+            std::vector<std::pair<std::string, Object*>> named_binds;
+            if (!parse_binding_list(real_bindings, named_binds)) return false;
+
+            std::vector<Object*> param_list;
+            std::vector<Object*> init_list;
+            for (auto& b : named_binds) {
+                param_list.push_back(get_symbol(b.first));
+                init_list.push_back(b.second);
+            }
+
+            Object* lam = cons(get_symbol("lambda"), cons(vector_to_pair(param_list), real_body));
+            Object* letrec_bind = vector_to_pair({get_symbol(loop_name), lam});
+            Object* letrec_bindings = cons(letrec_bind, nullptr);
+
+            std::vector<Object*> call_items = {get_symbol(loop_name)};
+            call_items.insert(call_items.end(), init_list.begin(), init_list.end());
+            Object* call_expr = vector_to_pair(call_items);
+
+            Object* transformed_named_let = vector_to_pair({get_symbol("letrec"), letrec_bindings, call_expr});
+            return compile_subset_expr(transformed_named_let, code, constants, env, tail);
+        }
+
+        std::vector<std::pair<std::string, Object*>> binds;
+        if (!parse_binding_list(bindings_expr, binds)) return false;
+
+        auto make_binding = [&](const std::string& name, Object* val_expr) {
+            return cons(get_symbol(name), cons(val_expr, nullptr));
+        };
+
+        if (is_symbol_name(head, "let")) {
+            std::vector<std::string> params;
+            for (auto& b : binds) {
+                if (!compile_subset_expr(b.second, code, constants, env)) return false;
+                params.push_back(b.first);
+            }
+
+            CompileEnv body_env = env;
+            body_env.insert(body_env.begin(), params);
+            std::vector<Object*> forms = pair_to_vector(body_list);
+            std::vector<int> body_code;
+            if (forms.empty()) body_code.push_back(OP_LDNIL);
+            else {
+                for (size_t i = 0; i < forms.size(); ++i) {
+                    bool is_last = (i + 1 == forms.size());
+                    if (!compile_subset_expr(forms[i], body_code, constants, body_env, is_last)) return false;
+                    if (!is_last) body_code.push_back(OP_POP);
+                }
+            }
+            body_code.push_back(OP_RTN);
+            ParamSpec let_spec;
+            let_spec.fixed = params;
+            let_spec.has_rest = false;
+            Object* clo_const = make_vm_code_closure_constant(body_code, let_spec);
+            code.push_back(OP_LDF);
+            code.push_back(add_constant(constants, clo_const));
+            code.push_back(OP_CALL);
+            code.push_back(static_cast<int>(binds.size()));
+            return true;
+        }
+
+        if (is_symbol_name(head, "let*")) {
+            if (binds.empty()) {
+                std::vector<Object*> forms = pair_to_vector(body_list);
+                if (forms.empty()) {
+                    code.push_back(OP_LDNIL);
+                    return true;
+                }
+                for (size_t i = 0; i < forms.size(); ++i) {
+                    bool is_last = (i + 1 == forms.size());
+                    if (!compile_subset_expr(forms[i], code, constants, env, tail && is_last)) return false;
+                    if (!is_last) code.push_back(OP_POP);
+                }
+                return true;
+            }
+
+            std::vector<std::pair<std::string, Object*>> rest_binds(binds.begin() + 1, binds.end());
+            Object* nested_body_expr = nullptr;
+            if (rest_binds.empty()) {
+                std::vector<Object*> begin_items;
+                begin_items.push_back(get_symbol("begin"));
+                std::vector<Object*> body_forms = pair_to_vector(body_list);
+                begin_items.insert(begin_items.end(), body_forms.begin(), body_forms.end());
+                nested_body_expr = vector_to_pair(begin_items);
+            } else {
+                std::vector<Object*> rest_bind_nodes;
+                for (auto& b : rest_binds) rest_bind_nodes.push_back(make_binding(b.first, b.second));
+                Object* rest_bindings_expr = vector_to_pair(rest_bind_nodes);
+                std::vector<Object*> letstar_items;
+                letstar_items.push_back(get_symbol("let*"));
+                letstar_items.push_back(rest_bindings_expr);
+                std::vector<Object*> body_forms = pair_to_vector(body_list);
+                letstar_items.insert(letstar_items.end(), body_forms.begin(), body_forms.end());
+                nested_body_expr = vector_to_pair(letstar_items);
+            }
+
+            std::vector<Object*> one_binding = {make_binding(binds[0].first, binds[0].second)};
+            Object* one_bindings_expr = vector_to_pair(one_binding);
+            Object* transformed = vector_to_pair({get_symbol("let"), one_bindings_expr, nested_body_expr});
+            return compile_subset_expr(transformed, code, constants, env, tail);
+        }
+
+        // letrec -> (let ((x ':undef) ...) (set! x e) ... body...)
+        std::vector<Object*> init_bind_nodes;
+        for (auto& b : binds) init_bind_nodes.push_back(make_binding(b.first, vector_to_pair({get_symbol("quote"), get_symbol(":undef")})));
+        Object* init_bindings_expr = vector_to_pair(init_bind_nodes);
+
+        std::vector<Object*> letrec_body_items;
+        letrec_body_items.push_back(get_symbol("let"));
+        letrec_body_items.push_back(init_bindings_expr);
+        for (auto& b : binds) {
+            Object* set_form = vector_to_pair({get_symbol("set!"), get_symbol(b.first), b.second});
+            letrec_body_items.push_back(set_form);
+        }
+        std::vector<Object*> original_forms = pair_to_vector(body_list);
+        letrec_body_items.insert(letrec_body_items.end(), original_forms.begin(), original_forms.end());
+        Object* transformed_letrec = vector_to_pair(letrec_body_items);
+        if (g_trace_letrec && should_trace_letrec_expr(expr)) {
+            trace_letrec_expr("compile-letrec-input", expr);
+            trace_letrec_expr("compile-letrec-expanded", transformed_letrec);
+        }
+        return compile_subset_expr(transformed_letrec, code, constants, env, tail);
+    }
+
+    // --- and / or / cond / when / unless expansion in compiler ---
+    if (is_symbol_name(head, "and")) {
+        std::vector<Object*> forms = pair_to_vector(rest);
+        if (forms.empty()) {
+            code.push_back(OP_LDTRUE);
+            return true;
+        }
+        if (forms.size() == 1) return compile_subset_expr(forms[0], code, constants, env, tail);
+        // (and a b ...) -> (if a (and b ...) false)
+        std::vector<Object*> tail_forms(forms.begin() + 1, forms.end());
+        std::vector<Object*> and_tail = {get_symbol("and")};
+        and_tail.insert(and_tail.end(), tail_forms.begin(), tail_forms.end());
+        Object* transformed = vector_to_pair({
+            get_symbol("if"), forms[0], vector_to_pair(and_tail), get_symbol("false")
+        });
+        return compile_subset_expr(transformed, code, constants, env, tail);
+    }
+    if (is_symbol_name(head, "or")) {
+        std::vector<Object*> forms = pair_to_vector(rest);
+        if (forms.empty()) {
+            code.push_back(OP_LDFALSE);
+            return true;
+        }
+        if (forms.size() == 1) return compile_subset_expr(forms[0], code, constants, env, tail);
+        // (or a b ...) -> ((lambda (t) (if t t (or b ...))) a)
+        std::vector<Object*> tail_forms(forms.begin() + 1, forms.end());
+        std::vector<Object*> or_tail = {get_symbol("or")};
+        or_tail.insert(or_tail.end(), tail_forms.begin(), tail_forms.end());
+        Object* t_sym = get_symbol("_or_t_");
+        Object* inner_if = vector_to_pair({get_symbol("if"), t_sym, t_sym, vector_to_pair(or_tail)});
+        Object* lam = vector_to_pair({get_symbol("lambda"), vector_to_pair({t_sym}), inner_if});
+        Object* transformed = vector_to_pair({lam, forms[0]});
+        return compile_subset_expr(transformed, code, constants, env, tail);
+    }
+    if (is_symbol_name(head, "cond")) {
+        // expand to nested ifs
+        Object* cur = rest;
+        if (!cur || cur->type != PAIR) {
+            code.push_back(OP_LDNIL);
+            return true;
+        }
+        Object* clause = cur->pair.car;
+        Object* remaining = cur->pair.cdr;
+        if (!clause || clause->type != PAIR) return false;
+        Object* test = clause->pair.car;
+        Object* body = clause->pair.cdr;
+        if (is_symbol_name(test, "else")) {
+            std::vector<Object*> body_forms = pair_to_vector(body);
+            if (body_forms.empty()) { code.push_back(OP_LDNIL); return true; }
+            Object* begin_form = vector_to_pair([&]() {
+                std::vector<Object*> v = {get_symbol("begin")};
+                v.insert(v.end(), body_forms.begin(), body_forms.end());
+                return v;
+            }());
+            return compile_subset_expr(begin_form, code, constants, env, tail);
+        }
+        std::vector<Object*> body_forms = pair_to_vector(body);
+        Object* then_part;
+        if (body_forms.empty()) then_part = test;
+        else {
+            std::vector<Object*> begin_items = {get_symbol("begin")};
+            begin_items.insert(begin_items.end(), body_forms.begin(), body_forms.end());
+            then_part = vector_to_pair(begin_items);
+        }
+        Object* else_part = remaining
+            ? vector_to_pair([&]() {
+                std::vector<Object*> v = {get_symbol("cond")};
+                std::vector<Object*> rest_clauses = pair_to_vector(remaining);
+                v.insert(v.end(), rest_clauses.begin(), rest_clauses.end());
+                return v;
+            }())
+            : nullptr;
+        Object* transformed = else_part
+            ? vector_to_pair({get_symbol("if"), test, then_part, else_part})
+            : vector_to_pair({get_symbol("if"), test, then_part, nullptr});
+        return compile_subset_expr(transformed, code, constants, env, tail);
+    }
+    if (is_symbol_name(head, "when")) {
+        Object* test = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        std::vector<Object*> body_forms = pair_to_vector(body);
+        if (body_forms.empty()) { code.push_back(OP_LDNIL); return true; }
+        std::vector<Object*> begin_items = {get_symbol("begin")};
+        begin_items.insert(begin_items.end(), body_forms.begin(), body_forms.end());
+        Object* transformed = vector_to_pair({get_symbol("if"), test, vector_to_pair(begin_items), nullptr});
+        return compile_subset_expr(transformed, code, constants, env, tail);
+    }
+    if (is_symbol_name(head, "unless")) {
+        Object* test = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        std::vector<Object*> body_forms = pair_to_vector(body);
+        if (body_forms.empty()) { code.push_back(OP_LDNIL); return true; }
+        std::vector<Object*> begin_items = {get_symbol("begin")};
+        begin_items.insert(begin_items.end(), body_forms.begin(), body_forms.end());
+        // (unless test body) -> (if (not test) body)
+        Object* not_test = vector_to_pair({get_symbol("not"), test});
+        Object* transformed = vector_to_pair({get_symbol("if"), not_test, vector_to_pair(begin_items), nullptr});
+        return compile_subset_expr(transformed, code, constants, env, tail);
+    }
+
+    if (is_symbol_name(head, "do")) {
+        Object* var_form = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* rest2 = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* test_form = (rest2 && rest2->type == PAIR) ? rest2->pair.car : nullptr;
+        Object* body = (rest2 && rest2->type == PAIR) ? rest2->pair.cdr : nullptr;
+
+        std::vector<Object*> vars, inits, steps;
+        for (Object* cur = var_form; cur && cur->type == PAIR; cur = cur->pair.cdr) {
+            Object* b = cur->pair.car;
+            std::vector<Object*> bv = pair_to_vector(b);
+            if (bv.empty()) continue;
+            vars.push_back(bv[0]);
+            inits.push_back(bv.size() > 1 ? bv[1] : nullptr);
+            steps.push_back(bv.size() > 2 ? bv[2] : bv[0]);
+        }
+
+        Object* test_expr = (test_form && test_form->type == PAIR) ? test_form->pair.car : nullptr;
+        Object* result_forms = (test_form && test_form->type == PAIR) ? test_form->pair.cdr : nullptr;
+
+        std::string loop_sym = "_do_loop_" + std::to_string(++g_do_loop_counter);
+        std::vector<Object*> param_syms(vars.begin(), vars.end());
+
+        std::vector<Object*> step_call = {get_symbol(loop_sym)};
+        step_call.insert(step_call.end(), steps.begin(), steps.end());
+
+        Object* then_part = nullptr;
+        std::vector<Object*> rfv = pair_to_vector(result_forms);
+        if (rfv.size() == 1) {
+            then_part = rfv[0];
+        } else if (!rfv.empty()) {
+            std::vector<Object*> begin_items = {get_symbol("begin")};
+            begin_items.insert(begin_items.end(), rfv.begin(), rfv.end());
+            then_part = vector_to_pair(begin_items);
+        }
+
+        std::vector<Object*> body_forms = pair_to_vector(body);
+        std::vector<Object*> else_items = {get_symbol("begin")};
+        else_items.insert(else_items.end(), body_forms.begin(), body_forms.end());
+        else_items.push_back(vector_to_pair(step_call));
+        Object* else_part = vector_to_pair(else_items);
+
+        Object* if_expr = vector_to_pair({
+            get_symbol("if"),
+            test_expr,
+            then_part ? then_part : (Object*)nullptr,
+            else_part
+        });
+
+        Object* lam = cons(get_symbol("lambda"), cons(vector_to_pair(param_syms), cons(if_expr, nullptr)));
+        Object* letrec_bind = vector_to_pair({get_symbol(loop_sym), lam});
+        Object* letrec_bindings = cons(letrec_bind, nullptr);
+
+        std::vector<Object*> call_items = {get_symbol(loop_sym)};
+        call_items.insert(call_items.end(), inits.begin(), inits.end());
+        Object* letrec_expr = vector_to_pair({
+            get_symbol("letrec"),
+            letrec_bindings,
+            vector_to_pair(call_items)
+        });
+
+        return compile_subset_expr(letrec_expr, code, constants, env, tail);
+    }
+
+    std::vector<Object*> args = pair_to_vector(rest);
+    for (auto* a : args) {
+        if (!compile_subset_expr(a, code, constants, env)) return false;
+    }
+
+    if (head && head->type == SYMBOL && head->sym) {
+        int level = 0;
+        int index = 0;
+        if (!find_local(env, *head->sym, level, index) && globals.find(*head->sym) != globals.end()) {
+            code.push_back(tail ? OP_TCALLG : OP_CALLG);
+            code.push_back(add_constant(constants, head));
+            code.push_back(static_cast<int>(args.size()));
+            return true;
+        }
+    }
+
+    if (!compile_subset_expr(head, code, constants, env)) return false;
+    code.push_back(tail ? OP_TCALL : OP_CALL);
+    code.push_back(static_cast<int>(args.size()));
+    return true;
+}
+
+bool try_eval_expr_via_vm(Object* expr, Object*& out_value) {
+    constexpr int OP_STOP = 15;
+    bool trace_target = g_trace_letrec && should_trace_letrec_expr(expr);
+
+    std::vector<int> code;
+    std::vector<Object*> constants;
+    CompileEnv env;
+    std::vector<std::vector<Object*>> vm_lex_env;
+
+    // Bridge evaluator lexical frames into VM compile/runtime environments.
+    // g_eval_env_stack keeps outer->inner order, while VM expects frame 0 to be current.
+    for (auto it = g_eval_env_stack.rbegin(); it != g_eval_env_stack.rend(); ++it) {
+        std::vector<std::string> name_frame;
+        std::vector<Object*> value_frame;
+        name_frame.reserve(it->size());
+        value_frame.reserve(it->size());
+        for (const auto& kv : *it) {
+            name_frame.push_back(kv.first);
+            value_frame.push_back(make_lex_cell(kv.second));
+        }
+        env.push_back(std::move(name_frame));
+        vm_lex_env.push_back(std::move(value_frame));
+    }
+
+    if (!compile_subset_expr(expr, code, constants, env)) {
+        g_vm_subset_failure_count++;
+        if (trace_target) {
+            trace_letrec_expr("vm-compile-failed", expr);
+        }
+        return false;
+    }
+    code.push_back(OP_STOP);
+
+    if (trace_target) {
+        trace_letrec_expr("vm-compile-expr", expr);
+        std::cerr << "[trace-letrec] vm-bytecode ";
+        print_code_stream(code, std::cerr, &constants);
+        std::cerr << std::endl;
+    }
+
+    VMContext vm_ctx;
+    vm_ctx.c = std::move(code);
+    vm_ctx.e = std::move(vm_lex_env);
+
+    if (trace_target) g_trace_vm_session++;
+    out_value = vm(vm_ctx, constants);
+    if (trace_target) {
+        g_trace_vm_session--;
+        std::cerr << "[trace-letrec] vm-result " << object_to_string(out_value) << std::endl;
+    }
+
+    g_vm_subset_success_count++;
+    return true;
+}
+
+Object* try_make_compiled_lambda(Object* params_expr, Object* body_list, const std::string* binding_name = nullptr, bool macro_binding = false) {
+    if (contains_macro_call(body_list)) return nullptr;
+
+    std::vector<Object*> lambda_items = {get_symbol("lambda"), params_expr};
+    Object* cur = body_list;
+    while (cur && cur->type == PAIR) {
+        lambda_items.push_back(cur->pair.car);
+        cur = cur->pair.cdr;
+    }
+    Object* lambda_expr = vector_to_pair(lambda_items);
+
+    std::unordered_map<std::string, Object*>& table = macro_binding ? macros : globals;
+    bool had_existing = false;
+    Object* saved = nullptr;
+    if (binding_name) {
+        auto it = table.find(*binding_name);
+        if (it != table.end()) {
+            had_existing = true;
+            saved = it->second;
+        }
+        table[*binding_name] = globals[":undef"];
+    }
+
+    Object* compiled = nullptr;
+    bool ok = try_eval_expr_via_vm(lambda_expr, compiled) && compiled && compiled->type == CLOSURE &&
+              compiled->closure.code && !compiled->closure.code->empty();
+
+    if (binding_name) {
+        if (had_existing) table[*binding_name] = saved;
+        else table.erase(*binding_name);
+    }
+
+    return ok ? compiled : nullptr;
+}
+
+struct TempRootScope {
+    size_t saved;
+    TempRootScope() : saved(g_temp_gc_roots.size()) {}
+    ~TempRootScope() { g_temp_gc_roots.resize(saved); }
+    void add(Object* obj) { g_temp_gc_roots.push_back(obj); }
+    void add_all(const std::vector<Object*>& objs) {
+        for (Object* obj : objs) g_temp_gc_roots.push_back(obj);
+    }
+};
+
+Object* call_primitive_rooted(Object* prim, std::vector<Object*>& args) {
+    if (!prim || prim->type != PRIMITIVE || !prim->prim) return nullptr;
+    TempRootScope roots;
+    roots.add(prim);
+    roots.add_all(args);
+    return (*prim->prim)(args);
+}
+
+Object* invoke_callable(Object* proc, const std::vector<Object*>& args) {
+    if (!proc) throw VMError("attempt to call nil");
+    TempRootScope call_roots;
+    call_roots.add(proc);
+    call_roots.add_all(args);
+    if (proc->type == PRIMITIVE) {
+        std::vector<Object*> rooted_args(args.begin(), args.end());
+        return call_primitive_rooted(proc, rooted_args);
+    }
+    if (proc->type == CLOSURE && proc->closure.code && proc->closure.env) {
+        if (proc->closure.constants && proc->closure.constants->size() >= 2 && proc->closure.code->empty()) {
+            Object* params_expr = (*proc->closure.constants)[0];
+            Object* body_list = (*proc->closure.constants)[1];
+            ParamSpec spec;
+            if (!extract_param_spec(params_expr, spec)) return nullptr;
+
+            // EvalEnvGuard: 例外・早期 return のどちらでも previous_env へ復元する
+            EvalEnvGuard _env_guard(g_eval_env_stack);
+            auto it_env = g_closure_lexenv.find(proc);
+            if (it_env != g_closure_lexenv.end()) {
+                g_eval_env_stack = it_env->second;
+            } else {
+                g_eval_env_stack.clear();
+            }
+
+            g_eval_env_stack.push_back(EvalFrame{});
+            EvalFrame call_frame_copy;  // back() の参照は push 後の realloc で無効化される恐れがあるため値コピー
+            if (!spec.has_rest && spec.fixed.size() != args.size()) {
+                return nullptr;  // _env_guard が復元
+            }
+            if (spec.has_rest && args.size() < spec.fixed.size()) {
+                return nullptr;  // _env_guard が復元
+            }
+            for (size_t i = 0; i < spec.fixed.size(); ++i) {
+                call_frame_copy[spec.fixed[i]] = args[i];
+            }
+            if (spec.has_rest) {
+                std::vector<Object*> rest_items(args.begin() + static_cast<long long>(spec.fixed.size()), args.end());
+                call_frame_copy[spec.rest] = vector_to_pair(rest_items);
+            }
+            g_eval_env_stack.back() = std::move(call_frame_copy);
+
+            Object* result = nullptr;
+            Object* cur = body_list;
+            while (cur && cur->type == PAIR) {
+                result = eval_expr(cur->pair.car);
+                cur = cur->pair.cdr;
+            }
+
+            return result;  // _env_guard が previous_env へ復元
+        }
+
+        VMContext call_ctx;
+        std::vector<Object*> call_frame;
+        if (!build_vm_call_frame(proc, args, call_frame)) {
+            return nullptr;
+        }
+        call_ctx.e = *proc->closure.env;
+        call_ctx.e.insert(call_ctx.e.begin(), call_frame);
+        call_ctx.c = *proc->closure.code;
+        std::vector<Object*> call_constants = proc->closure.constants ? *proc->closure.constants : std::vector<Object*>{};
+        return vm(call_ctx, call_constants);
+    }
+    if (proc->type == CONTINUATION && proc->continuation.s && proc->continuation.e && proc->continuation.c && proc->continuation.d) {
+        VMContext cont_ctx;
+        std::vector<Object*> cont_constants;
+        Object* cont_val = args.empty() ? nullptr : args[0];
+        if (!restore_continuation_state(cont_ctx, cont_constants, proc, cont_val, "invoke-continuation")) {
+            throw VMError("invalid continuation object");
+        }
+        return vm(cont_ctx, cont_constants);
+    }
+    throw VMError("attempt to call non-callable value: " + object_to_string(proc));
+}
+
+Object* macro_expand_1(Object* expr) {
+    if (!expr || expr->type != PAIR) return expr;
+    Object* head = expr->pair.car;
+    if (!head || head->type != SYMBOL || !head->sym) return expr;
+    auto it = macros.find(*head->sym);
+    if (it == macros.end() || !it->second) return expr;
+    std::vector<Object*> raw_args = pair_to_vector(expr->pair.cdr);
+    Object* expanded = invoke_callable(it->second, raw_args);
+    return expanded ? expanded : expr;
+}
+
+Object* macro_expand(Object* expr) {
+    constexpr int kMacroExpandMaxSteps = 256;
+    Object* current = expr;
+    for (int step = 0; step < kMacroExpandMaxSteps; ++step) {
+        Object* expanded = macro_expand_1(current);
+        if (expanded == current) return current;
+        current = expanded;
+    }
+    throw VMError("macro expansion limit exceeded");
+}
+
+Object* macro_expand_trace(Object* expr, int max_steps = 64) {
+    if (max_steps <= 0) max_steps = 1;
+    std::vector<Object*> steps;
+    steps.push_back(expr);
+
+    Object* current = expr;
+    for (int step = 0; step < max_steps; ++step) {
+        Object* expanded = macro_expand_1(current);
+        if (expanded == current) break;
+        steps.push_back(expanded);
+        current = expanded;
+    }
+    return vector_to_pair(steps);
+}
+
+Object* lookup_name(const std::string& name) {
+    for (auto it = g_eval_env_stack.rbegin(); it != g_eval_env_stack.rend(); ++it) {
+        auto fit = it->find(name);
+        if (fit != it->end()) return fit->second;
+    }
+    auto git = globals.find(name);
+    if (git != globals.end()) return git->second;
+    auto mit = macros.find(name);
+    if (mit != macros.end()) return mit->second;
+    return nullptr;
+}
+
+void define_name(const std::string& name, Object* value) {
+    if (!g_eval_env_stack.empty()) {
+        g_eval_env_stack.back()[name] = value;
+    } else {
+        globals[name] = value;
+    }
+}
+
+bool set_existing_name(const std::string& name, Object* value) {
+    for (auto it = g_eval_env_stack.rbegin(); it != g_eval_env_stack.rend(); ++it) {
+        auto fit = it->find(name);
+        if (fit != it->end()) {
+            fit->second = value;
+            return true;
+        }
+    }
+    auto git = globals.find(name);
+    if (git != globals.end()) {
+        git->second = value;
+        return true;
+    }
+    return false;
+}
+
+bool parse_binding_list(Object* bindings_expr, std::vector<std::pair<std::string, Object*>>& out) {
+    out.clear();
+    Object* cur = bindings_expr;
+    while (cur) {
+        if (cur->type != PAIR || !cur->pair.car || cur->pair.car->type != PAIR) return false;
+        Object* bind = cur->pair.car;
+        Object* name_obj = bind->pair.car;
+        Object* bind_tail = bind->pair.cdr;
+        if (!name_obj || name_obj->type != SYMBOL || !name_obj->sym || !bind_tail || bind_tail->type != PAIR) return false;
+        out.push_back({*name_obj->sym, bind_tail->pair.car});
+        cur = cur->pair.cdr;
+    }
+    return true;
+}
+
+Object* make_eval_closure(Object* params_expr, Object* body_list) {
+    ParamSpec spec;
+    if (!extract_param_spec(params_expr, spec)) return nullptr;
+    Object* clo = alloc(CLOSURE);
+    clo->closure.code = new std::vector<int>();
+    clo->closure.env = new std::vector<std::vector<Object*>>();
+    clo->closure.constants = new std::vector<Object*>({params_expr, body_list});
+    g_closure_lexenv[clo] = g_eval_env_stack;
+    return clo;
+}
+
+bool lookup_lexical_now(const std::string& name, Object*& value) {
+    for (auto it = g_eval_env_stack.rbegin(); it != g_eval_env_stack.rend(); ++it) {
+        auto fit = it->find(name);
+        if (fit != it->end()) {
+            value = fit->second;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool try_eval_call_via_vm(const std::string& global_name, const std::vector<Object*>& args, Object*& out_value) {
+    auto it = globals.find(global_name);
+    if (it == globals.end() || !it->second) return false;
+    if (it->second->type != PRIMITIVE) return false;
+
+    VMContext call_ctx;
+    std::vector<Object*> constants;
+    constants.reserve(args.size() + 1);
+    for (auto* a : args) constants.push_back(a);
+    Object* sym = get_symbol(global_name);
+    if (!sym) return false;
+    constants.push_back(sym);
+
+    // Keep these aligned with enum Op.
+    constexpr int OP_LDC = 1;
+    constexpr int OP_STOP = 15;
+    constexpr int OP_CALLG = 18;
+
+    for (size_t i = 0; i < args.size(); ++i) {
+        call_ctx.c.push_back(OP_LDC);
+        call_ctx.c.push_back(static_cast<int>(i));
+    }
+    call_ctx.c.push_back(OP_CALLG);
+    call_ctx.c.push_back(static_cast<int>(constants.size() - 1));
+    call_ctx.c.push_back(static_cast<int>(args.size()));
+    call_ctx.c.push_back(OP_STOP);
+
+    out_value = vm(call_ctx, constants);
+    return true;
+}
+
+bool is_symbol_name(Object* obj, const std::string& name) {
+    return obj && obj->type == SYMBOL && obj->sym && *obj->sym == name;
+}
+
+bool is_special_form_name(const std::string& name) {
+    return name == "quote" || name == "backquote" || name == "if" ||
+           name == "begin" || name == "lambda" || name == "call/cc" ||
+           name == "define" || name == "define-macro" || name == "set!" ||
+           name == "let" || name == "let*" || name == "letrec" ||
+           name == "and" || name == "or" || name == "cond" ||
+           name == "when" || name == "unless" || name == "case" ||
+           name == "do";
+}
+
+std::string format_unbound_symbol_error(const std::string& name) {
+    if (is_special_form_name(name)) {
+        return "syntax keyword cannot be used as a value: " + name;
+    }
+    return "unbound symbol: " + name;
+}
+
+bool is_tagged_form(Object* obj, const std::string& tag) {
+    return obj && obj->type == PAIR && is_symbol_name(obj->pair.car, tag) && obj->pair.cdr &&
+           obj->pair.cdr->type == PAIR && !obj->pair.cdr->pair.cdr;
+}
+
+Object* wrap_unary_form(const std::string& name, Object* body) {
+    return cons(get_symbol(name), cons(body, nullptr));
+}
+
+Object* backquote_transfer(Object* expr) {
+    if (!expr) {
+        return vector_to_pair({get_symbol("quote"), nullptr});
+    }
+    if (expr->type != PAIR) {
+        return vector_to_pair({get_symbol("quote"), expr});
+    }
+
+    std::vector<Object*> items = pair_to_vector(expr);
+    if (items.size() == 2 && is_symbol_name(items[0], "unquote")) {
+        return items[1];
+    }
+
+    Object* result = vector_to_pair({get_symbol("quote"), nullptr});
+    for (auto it = items.rbegin(); it != items.rend(); ++it) {
+        Object* item = *it;
+        if (is_tagged_form(item, "unquote")) {
+            Object* inner = item->pair.cdr->pair.car;
+            result = vector_to_pair({get_symbol("cons"), inner, result});
+        } else if (is_tagged_form(item, "splice")) {
+            Object* inner = item->pair.cdr->pair.car;
+            result = vector_to_pair({get_symbol("append"), inner, result});
+        } else if (item && item->type == PAIR) {
+            result = vector_to_pair({get_symbol("cons"), backquote_transfer(item), result});
+        } else {
+            result = vector_to_pair({get_symbol("cons"), vector_to_pair({get_symbol("quote"), item}), result});
+        }
+    }
+    return result;
+}
+
+Object* eval_sequence(Object* body_list) {
+    Object* result = nullptr;
+    Object* cur = body_list;
+    while (cur) {
+        if (!cur || cur->type != PAIR) break;
+        result = eval_expr(cur->pair.car);
+        cur = cur->pair.cdr;
+    }
+    return result;
+}
+
+static bool contains_macro_call(Object* expr) {
+    if (!expr || expr->type != PAIR) return false;
+
+    Object* head = expr->pair.car;
+    if (head && head->type == SYMBOL && head->sym) {
+        auto it = macros.find(*head->sym);
+        if (it != macros.end() && it->second) return true;
+    }
+
+    return contains_macro_call(expr->pair.car) || contains_macro_call(expr->pair.cdr);
+}
+
+bool contains_lexical_set(Object* expr) {
+    if (!expr || expr->type != PAIR) return false;
+
+    Object* head = expr->pair.car;
+    if (is_symbol_name(head, "quote") || is_symbol_name(head, "backquote")) {
+        return false;
+    }
+
+    if (is_symbol_name(head, "set!")) {
+        Object* rest = expr->pair.cdr;
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        if (name_obj && name_obj->type == SYMBOL && name_obj->sym) {
+            Object* tmp = nullptr;
+            if (lookup_lexical_now(*name_obj->sym, tmp)) return true;
+        }
+    }
+
+    return contains_lexical_set(expr->pair.car) || contains_lexical_set(expr->pair.cdr);
+}
+
+Object* eval_expr(Object* expr) {
+    if (!expr) return nullptr;
+    if (expr->type == INT || expr->type == STRING || expr->type == PRIMITIVE || expr->type == CLOSURE || expr->type == CONTINUATION || expr->type == PORT) return expr;
+    if (expr->type == SYMBOL) {
+        Object* v = lookup_name(*expr->sym);
+        if (v) return v;
+        throw VMError(format_unbound_symbol_error(*expr->sym));
+    }
+    if (expr->type != PAIR) return expr;
+
+    Object* head = expr->pair.car;
+    Object* rest = expr->pair.cdr;
+
+    bool is_macro_call = false;
+    if (head && head->type == SYMBOL && head->sym) {
+        auto mit = macros.find(*head->sym);
+        is_macro_call = (mit != macros.end() && mit->second != nullptr);
+        if (!is_macro_call && !is_special_form_name(*head->sym) && !lookup_name(*head->sym)) {
+            throw VMError("unbound function: " + *head->sym);
+        }
+    }
+    if (g_trace_letrec && should_trace_letrec_expr(expr)) {
+        trace_letrec_expr("eval-expr", expr);
+    }
+    // VM compilation around lexical mutation is still fragile in nested eval-closure
+    // contexts. Route those expressions through the evaluator for correctness.
+    bool skip_vm_set = !g_eval_env_stack.empty() && contains_lexical_set(expr) && !is_symbol_name(head, "call/cc");
+
+    // Keep semantics stable: expressions containing any macro call are routed
+    // through evaluator expansion/execution instead of VM fast path.
+    bool has_macro_subexpr = contains_macro_call(expr);
+    if (!g_disable_vm_fast_path && !is_macro_call && !has_macro_subexpr && !skip_vm_set) {
+        Object* vm_out = nullptr;
+        if (try_eval_expr_via_vm(expr, vm_out)) {
+            if (g_trace_letrec && should_trace_letrec_expr(expr)) {
+                std::cerr << "[trace-letrec] eval-route vm" << std::endl;
+            }
+            return vm_out;
+        }
+    }
+
+    if (is_symbol_name(head, "quote")) {
+        return (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+    }
+    if (is_symbol_name(head, "backquote")) {
+        Object* arg = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        return eval_expr(backquote_transfer(arg));
+    }
+    if (is_symbol_name(head, "if")) {
+        Object* test_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail1 = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* then_expr = (tail1 && tail1->type == PAIR) ? tail1->pair.car : nullptr;
+        Object* tail2 = (tail1 && tail1->type == PAIR) ? tail1->pair.cdr : nullptr;
+        Object* else_expr = (tail2 && tail2->type == PAIR) ? tail2->pair.car : nullptr;
+        Object* cond = eval_expr(test_expr);
+        return is_true(cond) ? eval_expr(then_expr) : eval_expr(else_expr);
+    }
+    if (is_symbol_name(head, "begin")) {
+        if (!rest) return globals[":undef"];
+        return eval_sequence(rest);
+    }
+    if (is_symbol_name(head, "lambda")) {
+        Object* params_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        return make_eval_closure(params_expr, body_list);
+    }
+    if (is_symbol_name(head, "call/cc")) {
+        Object* proc_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* proc = eval_expr(proc_expr);
+        if (!proc) return nullptr;
+
+        Object* tag = alloc(UNDEF);
+        Object* cont = alloc(PRIMITIVE);
+        cont->prim = new std::function<Object*(std::vector<Object*>&)>([tag](std::vector<Object*>& args) -> Object* {
+            Object* value = args.empty() ? nullptr : args[0];
+            throw ContinuationEscape{tag, value};
+            return nullptr;  // unreachable
+        });
+
+        try {
+            std::vector<Object*> one_arg = {cont};
+            return invoke_callable(proc, one_arg);
+        } catch (const ContinuationEscape& esc) {
+            if (esc.tag == tag) return esc.value;
+            throw;
+        }
+    }
+    if (is_symbol_name(head, "define")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (!name_obj) return nullptr;
+
+        if (name_obj->type == SYMBOL && name_obj->sym) {
+            Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+            Object* val = nullptr;
+            if (val_expr && val_expr->type == PAIR && is_symbol_name(val_expr->pair.car, "lambda")) {
+                Object* params_expr = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.car : nullptr;
+                Object* body_list = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.cdr : nullptr;
+                val = try_make_compiled_lambda(params_expr, body_list, name_obj->sym, false);
+            }
+            if (!val) val = eval_expr(val_expr);
+            define_name(*name_obj->sym, val);
+            return name_obj;
+        }
+
+        if (name_obj->type == PAIR && name_obj->pair.car && name_obj->pair.car->type == SYMBOL && name_obj->pair.car->sym) {
+            Object* fname = name_obj->pair.car;
+            Object* params_expr = name_obj->pair.cdr;
+            Object* body_list = tail;
+            Object* clo = try_make_compiled_lambda(params_expr, body_list, fname->sym, false);
+            if (!clo) clo = make_eval_closure(params_expr, body_list);
+            if (!clo) return nullptr;
+            define_name(*fname->sym, clo);
+            return fname;
+        }
+        return nullptr;
+    }
+    if (is_symbol_name(head, "set!")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+        if (!name_obj || name_obj->type != SYMBOL || !name_obj->sym) return nullptr;
+        Object* val = eval_expr(val_expr);
+        if (!set_existing_name(*name_obj->sym, val)) {
+            globals[*name_obj->sym] = val;
+        }
+        return val;
+    }
+    if (is_symbol_name(head, "let") || is_symbol_name(head, "let*") || is_symbol_name(head, "letrec")) {
+        Object* bindings_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body_list = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+
+        // named let: (let name ((var init) ...) body...)
+        if (is_symbol_name(head, "let") && bindings_expr && bindings_expr->type == SYMBOL && bindings_expr->sym) {
+            std::string loop_name = *bindings_expr->sym;
+            Object* real_bindings = (body_list && body_list->type == PAIR) ? body_list->pair.car : nullptr;
+            Object* real_body = (body_list && body_list->type == PAIR) ? body_list->pair.cdr : nullptr;
+            std::vector<std::pair<std::string, Object*>> binds;
+            if (!parse_binding_list(real_bindings, binds)) return nullptr;
+
+            // build: (letrec ((name (lambda (vars...) body...))) (name inits...))
+            std::vector<Object*> param_list;
+            std::vector<Object*> init_list;
+            for (auto& b : binds) {
+                param_list.push_back(get_symbol(b.first));
+                init_list.push_back(b.second);
+            }
+            Object* lam = cons(get_symbol("lambda"), cons(vector_to_pair(param_list), real_body));
+            Object* letrec_bind = vector_to_pair({get_symbol(loop_name), lam});
+            Object* letrec_bindings = cons(letrec_bind, nullptr);
+            std::vector<Object*> call_items = {get_symbol(loop_name)};
+            call_items.insert(call_items.end(), init_list.begin(), init_list.end());
+            Object* call_expr = vector_to_pair(call_items);
+            Object* letrec_expr = vector_to_pair({get_symbol("letrec"), letrec_bindings, call_expr});
+            if (g_trace_letrec) {
+                trace_letrec_expr("named-let-expanded", letrec_expr);
+            }
+            return eval_expr(letrec_expr);
+        }
+
+        std::vector<std::pair<std::string, Object*>> binds;
+        if (!parse_binding_list(bindings_expr, binds)) return nullptr;
+
+        if (is_symbol_name(head, "let")) {
+            std::vector<Object*> values;
+            for (auto& b : binds) values.push_back(eval_expr(b.second));
+            EvalFramePushGuard _let_guard(g_eval_env_stack);  // 例外時も pop_back を保証
+            for (size_t i = 0; i < binds.size(); ++i) g_eval_env_stack.back()[binds[i].first] = values[i];
+            return eval_sequence(body_list);
+        }
+
+        if (is_symbol_name(head, "let*")) {
+            EvalFramePushGuard _lets_guard(g_eval_env_stack);  // 例外時も pop_back を保証
+            for (auto& b : binds) {
+                g_eval_env_stack.back()[b.first] = eval_expr(b.second);
+            }
+            return eval_sequence(body_list);
+        }
+
+        // letrec
+        EvalFramePushGuard _letrec_guard(g_eval_env_stack);  // 例外時も pop_back を保証
+        for (auto& b : binds) g_eval_env_stack.back()[b.first] = globals[":undef"];
+        for (auto& b : binds) g_eval_env_stack.back()[b.first] = eval_expr(b.second);
+        // letrec requires closures to see the finalized recursive frame.
+        for (auto& b : binds) {
+            Object* v = g_eval_env_stack.back()[b.first];
+            if (v && v->type == CLOSURE) {
+                g_closure_lexenv[v] = g_eval_env_stack;
+            }
+        }
+        return eval_sequence(body_list);
+    }
+
+    // --- and / or / cond / when / unless / case ---
+    if (is_symbol_name(head, "and")) {
+        std::vector<Object*> forms = pair_to_vector(rest);
+        if (forms.empty()) return globals["true"];
+        if (forms.size() == 1) return eval_expr(forms[0]);
+        for (size_t i = 0; i + 1 < forms.size(); ++i) {
+            Object* v = eval_expr(forms[i]);
+            if (!is_true(v)) return globals["false"];
+        }
+        return eval_expr(forms.back());
+    }
+    if (is_symbol_name(head, "or")) {
+        std::vector<Object*> forms = pair_to_vector(rest);
+        if (forms.empty()) return globals["false"];
+        if (forms.size() == 1) return eval_expr(forms[0]);
+        for (size_t i = 0; i + 1 < forms.size(); ++i) {
+            Object* v = eval_expr(forms[i]);
+            if (is_true(v)) return v;
+        }
+        return eval_expr(forms.back());
+    }
+    if (is_symbol_name(head, "cond")) {
+        Object* cur = rest;
+        while (cur && cur->type == PAIR) {
+            Object* clause = cur->pair.car;
+            cur = cur->pair.cdr;
+            if (!clause || clause->type != PAIR) continue;
+            Object* test = clause->pair.car;
+            Object* body = clause->pair.cdr;
+            if (is_symbol_name(test, "else")) {
+                return eval_sequence(body);
+            }
+            Object* tv = eval_expr(test);
+            if (is_true(tv)) {
+                if (!body) return tv;
+                return eval_sequence(body);
+            }
+        }
+        return nullptr;
+    }
+    if (is_symbol_name(head, "when")) {
+        Object* test = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (is_true(eval_expr(test))) return eval_sequence(body);
+        return nullptr;
+    }
+    if (is_symbol_name(head, "unless")) {
+        Object* test = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* body = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (!is_true(eval_expr(test))) return eval_sequence(body);
+        return nullptr;
+    }
+    if (is_symbol_name(head, "case")) {
+        Object* key_expr = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* key = eval_expr(key_expr);
+        Object* cur = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        while (cur && cur->type == PAIR) {
+            Object* clause = cur->pair.car;
+            cur = cur->pair.cdr;
+            if (!clause || clause->type != PAIR) continue;
+            Object* datums = clause->pair.car;
+            Object* body = clause->pair.cdr;
+            if (is_symbol_name(datums, "else")) return eval_sequence(body);
+            for (Object* d = datums; d && d->type == PAIR; d = d->pair.cdr) {
+                if (objects_equal(key, d->pair.car)) return eval_sequence(body);
+            }
+        }
+        return nullptr;
+    }
+
+    // do: (do ((var init step) ...) (test result...) body...)
+    if (is_symbol_name(head, "do")) {
+        Object* var_form = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* rest2 = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        Object* test_form = (rest2 && rest2->type == PAIR) ? rest2->pair.car : nullptr;
+        Object* body = (rest2 && rest2->type == PAIR) ? rest2->pair.cdr : nullptr;
+
+        // parse var-form: each binding is (var init) or (var init step)
+        std::vector<Object*> vars, inits, steps;
+        for (Object* cur = var_form; cur && cur->type == PAIR; cur = cur->pair.cdr) {
+            Object* b = cur->pair.car;
+            std::vector<Object*> bv = pair_to_vector(b);
+            if (bv.empty()) continue;
+            vars.push_back(bv[0]);
+            inits.push_back(bv.size() > 1 ? bv[1] : nullptr);
+            steps.push_back(bv.size() > 2 ? bv[2] : bv[0]);
+        }
+
+        Object* test_expr = (test_form && test_form->type == PAIR) ? test_form->pair.car : nullptr;
+        Object* result_forms = (test_form && test_form->type == PAIR) ? test_form->pair.cdr : nullptr;
+
+        // build: (letrec ((loop (lambda (vars...) (if test result (begin body... (loop steps...))))))
+        //           (loop inits...))
+        std::string loop_sym = "_do_loop_" + std::to_string(++g_do_loop_counter);
+        std::vector<Object*> param_syms;
+        for (auto* v : vars) param_syms.push_back(v);
+
+        std::vector<Object*> step_call = {get_symbol(loop_sym)};
+        for (auto* s : steps) step_call.push_back(s);
+
+        // then-part: (begin result...) or nil
+        Object* then_part;
+        std::vector<Object*> rfv = pair_to_vector(result_forms);
+        if (rfv.empty()) then_part = nullptr;
+        else if (rfv.size() == 1) then_part = rfv[0];
+        else {
+            std::vector<Object*> begin_items = {get_symbol("begin")};
+            begin_items.insert(begin_items.end(), rfv.begin(), rfv.end());
+            then_part = vector_to_pair(begin_items);
+        }
+
+        // else-part: (begin body... (loop steps...))
+        std::vector<Object*> body_forms = pair_to_vector(body);
+        std::vector<Object*> else_items;
+        else_items.push_back(get_symbol("begin"));
+        else_items.insert(else_items.end(), body_forms.begin(), body_forms.end());
+        else_items.push_back(vector_to_pair(step_call));
+        Object* else_part = vector_to_pair(else_items);
+
+        Object* if_expr = vector_to_pair({
+            get_symbol("if"), test_expr,
+            then_part ? then_part : (Object*)nullptr,
+            else_part
+        });
+
+        Object* lam = cons(get_symbol("lambda"), cons(vector_to_pair(param_syms), cons(if_expr, nullptr)));
+        Object* letrec_bind = vector_to_pair({get_symbol(loop_sym), lam});
+        Object* letrec_bindings = cons(letrec_bind, nullptr);
+        std::vector<Object*> call_items = {get_symbol(loop_sym)};
+        call_items.insert(call_items.end(), inits.begin(), inits.end());
+        Object* letrec_expr = vector_to_pair({
+            get_symbol("letrec"), letrec_bindings, vector_to_pair(call_items)
+        });
+        return eval_expr(letrec_expr);
+    }
+
+    if (is_symbol_name(head, "define-macro")) {
+        Object* name_obj = (rest && rest->type == PAIR) ? rest->pair.car : nullptr;
+        Object* tail = (rest && rest->type == PAIR) ? rest->pair.cdr : nullptr;
+        if (!name_obj) return nullptr;
+
+        if (name_obj->type == SYMBOL && name_obj->sym) {
+            Object* val_expr = (tail && tail->type == PAIR) ? tail->pair.car : nullptr;
+            Object* val = nullptr;
+            if (val_expr && val_expr->type == PAIR && is_symbol_name(val_expr->pair.car, "lambda")) {
+                Object* params_expr = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.car : nullptr;
+                Object* body_list = (val_expr->pair.cdr && val_expr->pair.cdr->type == PAIR) ? val_expr->pair.cdr->pair.cdr : nullptr;
+                val = try_make_compiled_lambda(params_expr, body_list, name_obj->sym, true);
+            }
+            if (!val) val = eval_expr(val_expr);
+            if (!val || (val->type != PRIMITIVE && val->type != CLOSURE && val->type != CONTINUATION)) {
+                return nullptr;
+            }
+            macros[*name_obj->sym] = val;
+            return name_obj;
+        }
+
+        if (name_obj->type == PAIR && name_obj->pair.car && name_obj->pair.car->type == SYMBOL && name_obj->pair.car->sym) {
+            Object* mname = name_obj->pair.car;
+            Object* params_expr = name_obj->pair.cdr;
+            Object* body_list = tail;
+            Object* clo = try_make_compiled_lambda(params_expr, body_list, mname->sym, true);
+            if (!clo) clo = make_eval_closure(params_expr, body_list);
+            if (!clo) return nullptr;
+            macros[*mname->sym] = clo;
+            return mname;
+        }
+        return nullptr;
+    }
+
+    if (head && head->type == SYMBOL && head->sym) {
+        auto mit = macros.find(*head->sym);
+        if (mit != macros.end() && mit->second) {
+            std::vector<Object*> raw_args = pair_to_vector(rest);
+            for (auto* a : raw_args) g_active_ctx->s.push_back(a);
+            Object* expanded = invoke_callable(mit->second, raw_args);
+            for (size_t i = 0; i < raw_args.size(); ++i) g_active_ctx->s.pop_back();
+            return eval_expr(expanded ? expanded : expr);
+        }
+    }
+
+    std::string head_symbol_name;
+    if (head && head->type == SYMBOL && head->sym) {
+        head_symbol_name = *head->sym;
+    }
+
+    Object* proc = eval_expr(head);
+    std::vector<Object*> evaled_args;
+    for (Object* cur = rest; cur && cur->type == PAIR; cur = cur->pair.cdr) {
+        Object* av = eval_expr(cur->pair.car);
+        evaled_args.push_back(av);
+    }
+
+    g_active_ctx->s.push_back(proc);
+    for (auto* a : evaled_args) g_active_ctx->s.push_back(a);
+    Object* result = nullptr;
+    bool vm_invoked = false;
+    if (!head_symbol_name.empty()) {
+        Object* vm_result = nullptr;
+        vm_invoked = try_eval_call_via_vm(head_symbol_name, evaled_args, vm_result);
+        if (vm_invoked) {
+            result = vm_result;
+        }
+    }
+    if (!vm_invoked) {
+        result = invoke_callable(proc, evaled_args);
+    }
+    for (size_t i = 0; i < evaled_args.size() + 1; ++i) g_active_ctx->s.pop_back();
+    return result;
+}
+
+enum Op { 
+    LD,
+    LDC,
+    LDG,
+    LDF,
+    LDCT,
+    LSET,
+    GSET,
+    APP,
+    TAPP,
+    RTN,
+    POP,
+    ARGS,
+    ARGS_AP,// Apply with args
+    DEF,
+    DEFM,
+    STOP,
+    CALL,
+    TCALL,
+    CALLG,
+    TCALLG,
+    LDNIL,
+    LDTRUE,
+    LDFALSE,
+    ADDI,
+    SUBI,
+    MULI,
+    EQI,
+    LTI,
+    GTI,
+    LEI,
+    GEI,
+    JZ,
+    JMP,
+    CALLCC,
+    SEL,
+    SELR,
+    JOIN
+};
+
+// ------------------------------------------------------------
+// VM: SECD 仮想マシン本体
+//
+// ctx.c に格納されたバイトコード列を pc=0 から実行し、
+// STOP 命令または RTN でダンプが空になったときに ctx.s の
+// スタックトップを返す。
+//
+// 主な実行ループの動作:
+//   - LDC/LDG/LD 系  : 値をスタックに積む
+//   - CALL/TCALL     : クロージャ呼び出し
+//                      CALL はダンプに {s,e,c,constants} を保存する
+//                      TCALL はダンプに保存しない（末尾呼び出し最適化）
+//   - RTN            : ダンプを pop してスタックトップを呼び出し元へ渡す
+//   - JZ/JMP         : 条件・無条件ジャンプ（if の実装）
+//   - DEF/GSET/LSET  : 変数への代入
+//   - CALLCC         : 現在の継続を CONTINUATION オブジェクトとして捕捉
+//
+// g_active_ctx と g_active_constants を更新することで、
+// VM 実行中に alloc が GC を正しく呼べるようにする。
+// ------------------------------------------------------------
+Object* vm(VMContext& ctx, std::vector<Object*>& constants) {
+    const unsigned long long vm_invocation_id = g_vm_invocation_next_id++;
+    g_vm_call_depth++;
+    g_vm_invocation_stack.push_back(vm_invocation_id);
+    VMContext* prev_ctx = g_active_ctx;
+    std::vector<Object*>* prev_constants = g_active_constants;
+    g_active_ctx = &ctx;
+    g_active_constants = &constants;
+    // RAII guard: restore g_active_ctx/g_active_constants even when exceptions
+    // (e.g. ContinuationEscape) unwind the stack out of vm().
+    struct CtxGuard {
+        VMContext** slot_ctx; VMContext* saved_ctx;
+        std::vector<Object*>** slot_con; std::vector<Object*>* saved_con;
+        int* slot_depth;
+        std::vector<unsigned long long>* invocation_stack;
+        ~CtxGuard() {
+            *slot_ctx = saved_ctx;
+            *slot_con = saved_con;
+            (*slot_depth)--;
+            if (!invocation_stack->empty()) invocation_stack->pop_back();
+        }
+    } ctx_guard{&g_active_ctx, prev_ctx, &g_active_constants, prev_constants, &g_vm_call_depth, &g_vm_invocation_stack};
+
+    constexpr size_t MAX_ENV_DEPTH = 10000;
+    constexpr size_t MAX_STACK_SIZE = 100000;
+    size_t step_count = 0;
+
+    try {
+        size_t pc = 0;
+
+        while (true) {
+            try {
+                while (pc < ctx.c.size()) {
+            if (step_count++ > MAX_VM_STEPS) {
+                std::cerr << "[vm] ERROR: Exceeded maximum instruction steps (" << MAX_VM_STEPS << ")" << std::endl;
+                return nullptr;
+            }
+            if (ctx.e.size() > MAX_ENV_DEPTH) {
+                std::cerr << "[vm] ERROR: Environment depth exceeded (" << ctx.e.size() << " > " << MAX_ENV_DEPTH << ")" << std::endl;
+                return nullptr;
+            }
+            if (ctx.s.size() > MAX_STACK_SIZE) {
+                std::cerr << "[vm] ERROR: Stack size exceeded (" << ctx.s.size() << " > " << MAX_STACK_SIZE << ")" << std::endl;
+                return nullptr;
+            }
+
+            Op cmd = static_cast<Op>(ctx.c[pc++]);
+        if (g_trace_vm_session > 0) {
+            std::cerr << "[trace-vm] pc=" << (pc - 1)
+                      << " op=" << op_to_string(static_cast<int>(cmd))
+                      << " s=" << ctx.s.size()
+                      << " e=" << ctx.e.size()
+                      << " d=" << ctx.d.size() << std::endl;
+        }
+        switch (cmd) {
+            case LDC:
+            {
+                size_t const_idx = static_cast<size_t>(ctx.c[pc++]);
+                if (const_idx >= constants.size()) {
+                    std::cerr << "[vm] ERROR: LDC: Invalid constant index " << const_idx << std::endl;
+                    return nullptr;
+                }
+                ctx.s.push_back(constants[const_idx]);
+                break;
+            }
+            case LDNIL:
+                ctx.s.push_back(nullptr);
+                break;
+            case LDTRUE:
+                ctx.s.push_back(globals["true"]);
+                break;
+            case LDFALSE:
+                ctx.s.push_back(globals["false"]);
+                break;
+            case ADDI:
+            case SUBI:
+            case MULI:
+            case EQI:
+            case LTI:
+            case GTI:
+            case LEI:
+            case GEI: {
+                if (ctx.s.size() < 2) {
+                    break;
+                }
+                Object* right = ctx.s.back();
+                ctx.s.pop_back();
+                Object* left = ctx.s.back();
+                ctx.s.pop_back();
+
+                if (left && right && left->type == INT && right->type == INT) {
+                    if (cmd == ADDI) {
+                        if (will_overflow_add(left->num, right->num)) {
+                            ctx.s.push_back(make_number((long long)left->num + (long long)right->num));
+                        } else {
+                            ctx.s.push_back(make_int(left->num + right->num));
+                        }
+                    }
+                    else if (cmd == SUBI) {
+                        if (will_overflow_sub(left->num, right->num)) {
+                            ctx.s.push_back(make_number((long long)left->num - (long long)right->num));
+                        } else {
+                            ctx.s.push_back(make_int(left->num - right->num));
+                        }
+                    }
+                    else if (cmd == MULI) {
+                        if (will_overflow_mul(left->num, right->num)) {
+                            ctx.s.push_back(make_number((long long)left->num * (long long)right->num));
+                        } else {
+                            ctx.s.push_back(make_int(left->num * right->num));
+                        }
+                    }
+                    else if (cmd == EQI) ctx.s.push_back(bool_obj(left->num == right->num));
+                    else if (cmd == LTI) ctx.s.push_back(bool_obj(left->num < right->num));
+                    else if (cmd == GTI) ctx.s.push_back(bool_obj(left->num > right->num));
+                    else if (cmd == LEI) ctx.s.push_back(bool_obj(left->num <= right->num));
+                    else ctx.s.push_back(bool_obj(left->num >= right->num));
+                } else {
+                    std::string fallback;
+                    if (cmd == ADDI) fallback = "+";
+                    else if (cmd == SUBI) fallback = "-";
+                    else if (cmd == MULI) fallback = "*";
+                    else if (cmd == EQI) fallback = "=";
+                    else if (cmd == LTI) fallback = "<";
+                    else if (cmd == GTI) fallback = ">";
+                    else if (cmd == LEI) fallback = "<=";
+                    else fallback = ">=";
+
+                    auto it = globals.find(fallback);
+                    if (it != globals.end() && it->second && it->second->type == PRIMITIVE && it->second->prim) {
+                        std::vector<Object*> args = {left, right};
+                        ctx.s.push_back(call_primitive_rooted(it->second, args));
+                    } else {
+                        ctx.s.push_back(nullptr);
+                    }
+                }
+                break;
+            }
+            case LDG: {
+                size_t const_idx = static_cast<size_t>(ctx.c[pc++]);
+                if (const_idx >= constants.size() || !constants[const_idx] || constants[const_idx]->type != SYMBOL) {
+                    throw VMError("LDG: invalid constant index");
+                }
+                std::string var_name = *constants[const_idx]->sym;
+                auto it = globals.find(var_name);
+                if (it == globals.end()) {
+                    throw VMError(format_unbound_symbol_error(var_name));
+                }
+                ctx.s.push_back(it->second);
+                break;
+            }
+            case LD: {
+                size_t i = static_cast<size_t>(ctx.c[pc++]);
+                size_t j = static_cast<size_t>(ctx.c[pc++]);
+                ctx.s.push_back(get_lvar(ctx.e, i, j));
+                break;
+            }
+            case LDF: {
+                size_t idx = static_cast<size_t>(ctx.c[pc++]);
+                Object* clo = alloc(CLOSURE);
+                clo->closure.code = new std::vector<int>(*constants[idx]->closure.code);
+                clo->closure.env = new std::vector<std::vector<Object*>>(ctx.e);
+                clo->closure.constants = new std::vector<Object*>(constants);
+                clo->closure.vm_fixed_arity = constants[idx]->closure.vm_fixed_arity;
+                clo->closure.vm_has_rest = constants[idx]->closure.vm_has_rest;
+                ctx.s.push_back(clo);
+                break;
+            }
+            case LDCT: {
+                Object* cont = alloc(CONTINUATION);
+                cont->continuation.s = new std::vector<Object*>(ctx.s);
+                cont->continuation.e = new std::vector<std::vector<Object*>>(ctx.e);
+                cont->continuation.c = new std::vector<int>(ctx.c.begin() + pc, ctx.c.end());
+                cont->continuation.d = new std::vector<DumpFrame>(ctx.d);
+                cont->continuation.constants = new std::vector<Object*>(constants);
+                cont->continuation.id = g_callcc_next_id++;
+                trace_callcc_event("capture-ldct",
+                                   cont->continuation.id,
+                                   cont->continuation.s->size(),
+                                   cont->continuation.e->size(),
+                                   cont->continuation.d->size(),
+                                   cont->continuation.c->size());
+                ctx.s.push_back(cont);
+                break;
+            }
+            case APP: {
+                if (ctx.s.empty()) break;
+                Object* clo = ctx.s.back(); 
+                ctx.s.pop_back(); 
+                
+                int nargs = ctx.c[pc++];
+                if (nargs < 0 || ctx.s.size() < static_cast<size_t>(nargs)) {
+                    std::cerr << "[vm] ERROR: APP: Stack underflow (nargs=" << nargs
+                              << ", stack=" << ctx.s.size() << ")" << std::endl;
+                    return nullptr;
+                }
+
+                if (clo->type == PRIMITIVE) {
+                    std::vector<Object*> prim_args;
+                    for (int i = 0; i < nargs; ++i) {
+                        prim_args.push_back(ctx.s[ctx.s.size() - nargs + i]);
+                    }
+
+                    Object* result = call_primitive_rooted(clo, prim_args);
+
+                    for (int i = 0; i < nargs; ++i) ctx.s.pop_back();
+                    
+                    ctx.s.push_back(result);
+
+                } else if (clo->type == CLOSURE) {
+                    std::vector<Object*> args;
+                    for (int i = 0; i < nargs; ++i) {
+                        args.push_back(ctx.s.back());
+                        ctx.s.pop_back();
+                    }
+                    std::reverse(args.begin(), args.end());
+
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        // Evaluator closure captured in CLOSURE payload.
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
+                        ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                        
+                        ctx.s.clear();
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), call_frame);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
+                    }
+
+                } else if (clo->type == CONTINUATION) {
+                    Object* cont_val = (nargs > 0) ? ctx.s.back() : nullptr;
+                    for (int i = 0; i < nargs; ++i) ctx.s.pop_back();
+                    if (!restore_continuation_state(ctx, constants, clo, cont_val, "invoke-app-cont")) {
+                        throw VMError("invalid continuation object");
+                    }
+                    pc = 0;
+                }
+                break;
+            }
+            case LSET: {
+                size_t i = static_cast<size_t>(ctx.c[pc++]);
+                size_t j = static_cast<size_t>(ctx.c[pc++]);
+                if (!ctx.s.empty()) {
+                    Object* assigned = ctx.s.back();
+                    set_lvar(ctx.e, i, j, assigned);
+                }
+                break;
+            }
+            case GSET: {
+                size_t sidx = static_cast<size_t>(ctx.c[pc++]);
+                if (sidx < constants.size() && constants[sidx] && constants[sidx]->type == SYMBOL && !ctx.s.empty()) {
+                    globals[*constants[sidx]->sym] = ctx.s.back();
+                }
+                break;
+            }
+            case CALL:
+            case TCALL: {
+                if (ctx.s.empty()) break;
+                int nargs = ctx.c[pc++];
+                if (ctx.s.size() < static_cast<size_t>(nargs + 1)) break;
+
+                Object* clo = ctx.s.back();
+                ctx.s.pop_back();
+
+                std::vector<Object*> args;
+                for (int i = 0; i < nargs; ++i) {
+                    args.push_back(ctx.s.back());
+                    ctx.s.pop_back();
+                }
+                std::reverse(args.begin(), args.end());
+
+                if (!clo) {
+                    ctx.s.push_back(nullptr);
+                    break;
+                }
+
+                if (clo->type == PRIMITIVE) {
+                    Object* result = call_primitive_rooted(clo, args);
+                    ctx.s.push_back(result);
+                } else if (clo->type == CLOSURE) {
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
+                        if (cmd == CALL) {
+                            ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                            ctx.s.clear();
+                        }
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), call_frame);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
+                    }
+                } else if (clo->type == CONTINUATION) {
+                    Object* cont_val = args.empty() ? nullptr : args[0];
+                    if (!restore_continuation_state(ctx, constants, clo, cont_val, "invoke-call-cont")) {
+                        throw VMError("invalid continuation object");
+                    }
+                    pc = 0;
+                }
+                break;
+            }
+            case CALLG:
+            case TCALLG: {
+                size_t sidx = static_cast<size_t>(ctx.c[pc++]);
+                int nargs = ctx.c[pc++];
+                if (sidx >= constants.size() || !constants[sidx] || constants[sidx]->type != SYMBOL) {
+                    throw VMError("CALLG: invalid callee constant");
+                }
+                std::string name = *constants[sidx]->sym;
+                auto it = globals.find(name);
+                if (it == globals.end()) {
+                    throw VMError("unbound function: " + name);
+                }
+                Object* clo = it->second;
+
+                if (ctx.s.size() < static_cast<size_t>(nargs)) break;
+                std::vector<Object*> args;
+                for (int i = 0; i < nargs; ++i) {
+                    args.push_back(ctx.s.back());
+                    ctx.s.pop_back();
+                }
+                std::reverse(args.begin(), args.end());
+
+                if (!clo) {
+                    throw VMError("attempt to call nil");
+                }
+                if (clo->type == PRIMITIVE) {
+                    Object* result = call_primitive_rooted(clo, args);
+                    ctx.s.push_back(result);
+                } else if (clo->type == CLOSURE) {
+                    if (clo->closure.code && clo->closure.code->empty()) {
+                        Object* result = invoke_callable(clo, args);
+                        ctx.s.push_back(result);
+                    } else {
+                        std::vector<Object*> call_frame;
+                        if (!build_vm_call_frame(clo, args, call_frame)) {
+                            return nullptr;
+                        }
+                        if (cmd == CALLG) {
+                            ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                            ctx.s.clear();
+                        }
+                        ctx.e = *clo->closure.env;
+                        ctx.e.insert(ctx.e.begin(), call_frame);
+                        ctx.c = *clo->closure.code;
+                        if (clo->closure.constants) constants = *clo->closure.constants;
+                        pc = 0;
+                    }
+                } else if (clo->type == CONTINUATION) {
+                    Object* cont_val = args.empty() ? nullptr : args[0];
+                    if (!restore_continuation_state(ctx, constants, clo, cont_val, "invoke-callg-cont")) {
+                        throw VMError("invalid continuation object");
+                    }
+                    pc = 0;
+                } else {
+                    throw VMError("attempt to call non-callable value: " + object_to_string(clo));
+                }
+                break;
+            }
+            case ARGS: {
+                int n = ctx.c[pc++];
+                if (n < 0 || ctx.s.size() < static_cast<size_t>(n)) break;
+                std::vector<Object*> items;
+                for (int i = 0; i < n; ++i) {
+                    items.push_back(ctx.s.back());
+                    ctx.s.pop_back();
+                }
+                std::reverse(items.begin(), items.end());
+                ctx.s.push_back(vector_to_pair(items));
+                break;
+            }
+            case ARGS_AP: {
+                int n = ctx.c[pc++];
+                if (n <= 0 || ctx.s.size() < static_cast<size_t>(n)) break;
+                Object* tail_list = ctx.s.back();
+                ctx.s.pop_back();
+                std::vector<Object*> tail_items = pair_to_vector(tail_list);
+                std::vector<Object*> prefix;
+                for (int i = 0; i < n - 1; ++i) {
+                    prefix.push_back(ctx.s.back());
+                    ctx.s.pop_back();
+                }
+                std::reverse(prefix.begin(), prefix.end());
+                prefix.insert(prefix.end(), tail_items.begin(), tail_items.end());
+                ctx.s.push_back(vector_to_pair(prefix));
+                break;
+            }
+            case POP:
+                if (!ctx.s.empty()) ctx.s.pop_back();
+                break;
+            case SEL: {
+                int t_operand = ctx.c[pc++];
+                int f_operand = ctx.c[pc++];
+                if (ctx.s.empty()) break;
+                Object* cond = ctx.s.back();
+                ctx.s.pop_back();
+                std::vector<int> t_clause = resolve_clause_operand(t_operand, constants);
+                std::vector<int> f_clause = resolve_clause_operand(f_operand, constants);
+                ctx.d.push_back({{}, {}, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                ctx.c = (cond == globals["false"]) ? f_clause : t_clause;
+                pc = 0;
+                break;
+            }
+            case SELR: {
+                int t_operand = ctx.c[pc++];
+                int f_operand = ctx.c[pc++];
+                if (ctx.s.empty()) break;
+                Object* cond = ctx.s.back();
+                ctx.s.pop_back();
+                std::vector<int> t_clause = resolve_clause_operand(t_operand, constants);
+                std::vector<int> f_clause = resolve_clause_operand(f_operand, constants);
+                ctx.c = (cond == globals["false"]) ? f_clause : t_clause;
+                pc = 0;
+                break;
+            }
+            case JOIN: {
+                if (ctx.d.empty()) break;
+                DumpFrame df = ctx.d.back();
+                ctx.d.pop_back();
+                ctx.c = df.c;
+                constants = df.constants;
+                pc = 0;
+                break;
+            }
+            case JZ: {
+                int offset = ctx.c[pc++];
+                if (ctx.s.empty()) break;
+                Object* cond = ctx.s.back();
+                ctx.s.pop_back();
+                if (cond == globals["false"]) {
+                    pc = static_cast<size_t>(static_cast<int>(pc) + offset);
+                }
+                break;
+            }
+            case JMP: {
+                int offset = ctx.c[pc++];
+                pc = static_cast<size_t>(static_cast<int>(pc) + offset);
+                break;
+            }
+            case RTN: {
+                if (ctx.d.empty()) goto end_vm;
+                if (ctx.s.empty()) {
+                    std::cerr << "[vm] ERROR: RTN: Empty stack on return"
+                              << " (e=" << ctx.e.size()
+                              << " d=" << ctx.d.size()
+                              << " c=" << ctx.c.size()
+                              << " last-cont=" << g_last_cont_restore_tag
+                              << "#" << g_last_cont_restore_id
+                              << ")" << std::endl;
+                    return nullptr;
+                }
+                Object* ret = ctx.s.back();
+                DumpFrame df = ctx.d.back(); ctx.d.pop_back();
+                ctx.s = df.s;
+                ctx.s.push_back(ret);
+                ctx.e = df.e;
+                ctx.c = df.c;
+                constants = df.constants;
+                pc = 0;
+                break;
+            }
+            case DEF:
+            case DEFM: {
+                size_t sidx = static_cast<size_t>(ctx.c[pc++]);
+                if (ctx.s.empty()) break;
+                Object* value = ctx.s.back();
+                ctx.s.pop_back();
+                if (sidx < constants.size() && constants[sidx] && constants[sidx]->type == SYMBOL) {
+                    Object* sym = constants[sidx];
+                    if (cmd == DEFM) {
+                        macros[*sym->sym] = value;
+                    } else {
+                        globals[*sym->sym] = value;
+                    }
+                    ctx.s.push_back(sym);
+                } else {
+                    ctx.s.push_back(nullptr);
+                }
+                break;
+            }
+            case CALLCC: {
+                if (ctx.s.empty()) break;
+                Object* fn = ctx.s.back();
+                ctx.s.pop_back();
+
+                Object* cont = alloc(CONTINUATION);
+                cont->continuation.s = new std::vector<Object*>(ctx.s);
+                cont->continuation.e = new std::vector<std::vector<Object*>>(ctx.e);
+                cont->continuation.c = new std::vector<int>(ctx.c.begin() + pc, ctx.c.end());
+                cont->continuation.d = new std::vector<DumpFrame>(ctx.d);
+                cont->continuation.constants = new std::vector<Object*>(constants);
+                cont->continuation.id = g_callcc_next_id++;
+                trace_callcc_event("capture-callcc",
+                                   cont->continuation.id,
+                                   cont->continuation.s->size(),
+                                   cont->continuation.e->size(),
+                                   cont->continuation.d->size(),
+                                   cont->continuation.c->size());
+
+                std::vector<Object*> fn_args = {cont};
+                if (!fn) { ctx.s.push_back(nullptr); break; }
+                if (fn->type == PRIMITIVE) {
+                    Object* r = call_primitive_rooted(fn, fn_args);
+                    ctx.s.push_back(r);
+                } else if (fn->type == CLOSURE) {
+                    ctx.d.push_back({ctx.s, ctx.e, std::vector<int>(ctx.c.begin() + pc, ctx.c.end()), constants});
+                    ctx.s.clear();
+                    std::vector<Object*> call_frame;
+                    if (!build_vm_call_frame(fn, fn_args, call_frame)) {
+                        return nullptr;
+                    }
+                    ctx.e = *fn->closure.env;
+                    ctx.e.insert(ctx.e.begin(), call_frame);
+                    ctx.c = *fn->closure.code;
+                    if (fn->closure.constants) constants = *fn->closure.constants;
+                    pc = 0;
+                } else if (fn->type == CONTINUATION) {
+                    Object* cont_val = nullptr;
+                    if (!restore_continuation_state(ctx, constants, fn, cont_val, "invoke-callcc-cont")) {
+                        throw VMError("invalid continuation object");
+                    }
+                    pc = 0;
+                }
+                break;
+            }
+            case STOP: goto end_vm;
+            default: break;
+        }
+                }
+                break;
+            } catch (const ContinuationEscape& esc) {
+                if (restore_continuation_state(ctx, constants, esc.tag, esc.value, "restore-vm-escape", true)) {
+                    pc = 0;
+                    continue;
+                }
+                throw;
+            }
+        }
+
+    } catch (const VMError& vme) {
+        throw;
+    } catch (const std::exception& e) {
+        std::cerr << "[vm] ERROR: Unexpected exception during execution: " << e.what() << std::endl;
+        return nullptr;
+    }
+
+end_vm:
+    return ctx.s.empty() ? nullptr : ctx.s.back();
+}
+
+// ------------------------------------------------------------
+// トークナイザ・リーダ
+//
+// tokenize(s) : 文字列を Token のリストに変換する
+// s_read      : トークン列から Scheme オブジェクトを1つ読み取る
+// s_read_list : ( ... ) の内側を再帰的に読み取る
+// s_input     : REPL 用の複数行入力（括弧が閉じるまで読み続ける）
+//
+// トークン種別:
+//   LPAREN/RPAREN : ( )
+//   DOT           : .  (ドット対 (a . b) 用)
+//   INT           : 整数リテラル
+//   STRING        : 文字列リテラル
+//   SYM           : シンボル
+//   QUOTE         : '  → (quote ...)
+//   BACKQUOTE     : `  → (backquote ...)
+//   UNQUOTE       : ,  → (unquote ...)
+//   SPLICE        : ,@ → (splice ...)
+//   END           : 入力終端
+// ------------------------------------------------------------
+enum TokenType { TOK_LPAREN, TOK_RPAREN, TOK_DOT, TOK_INT, TOK_STRING, TOK_SYM, TOK_QUOTE, TOK_BACKQUOTE, TOK_UNQUOTE, TOK_SPLICE, TOK_HASH_LPAREN, TOK_END };
+struct Token {
+    TokenType type;
+    std::string str;
+};
+
+bool is_int(const std::string& s) {
+    if (s.empty() || ((!isdigit(s[0])) && (s[0] != '-') && (s[0] != '+'))) return false;
+    char * p;
+    strtol(s.c_str(), &p, 10);
+    return (*p == 0);
+}
+
+std::vector<Token> tokenize(std::string s) {
+    std::vector<Token> tokens;
+    for (size_t i = 0; i < s.size(); ) {
+        if (isspace(s[i])) { i++; continue; }
+        if (s[i] == ';') {
+            while (i < s.size() && s[i] != '\n') i++;
+            continue;
+        }
+        if (s[i] == '(') { tokens.push_back({TOK_LPAREN, "("}); i++; }
+        else if (s[i] == ')') { tokens.push_back({TOK_RPAREN, ")"}); i++; }
+        else if (s[i] == '#' && i + 1 < s.size() && s[i+1] == '(') {
+            tokens.push_back({TOK_HASH_LPAREN, "#("});
+            i += 2;
+        }
+        else if (s[i] == '\'') { tokens.push_back({TOK_QUOTE, "'"}); i++; }
+        else if (s[i] == '`') { tokens.push_back({TOK_BACKQUOTE, "`"}); i++; }
+        else if (s[i] == ',') {
+            if (i + 1 < s.size() && s[i + 1] == '@') {
+                tokens.push_back({TOK_SPLICE, ",@"});
+                i += 2;
+            } else {
+                tokens.push_back({TOK_UNQUOTE, ","});
+                i++;
+            }
+        }
+        else if (s[i] == '"') {
+            i++; // skip opening quote
+            std::string text;
+            bool closed = false;
+            while (i < s.size()) {
+                char ch = s[i++];
+                if (ch == '\\') {
+                    if (i >= s.size()) {
+                        throw ParseError("unterminated string escape");
+                    }
+                    char esc = s[i++];
+                    switch (esc) {
+                        case 'n': text.push_back('\n'); break;
+                        case 't': text.push_back('\t'); break;
+                        case 'r': text.push_back('\r'); break;
+                        case '"': text.push_back('"'); break;
+                        case '\\': text.push_back('\\'); break;
+                        default: text.push_back(esc); break;
+                    }
+                    continue;
+                }
+                if (ch == '"') {
+                    closed = true;
+                    break;
+                }
+                text.push_back(ch);
+            }
+            if (!closed) {
+                throw ParseError("unterminated string literal");
+            }
+            tokens.push_back({TOK_STRING, text});
+        }
+        else {
+            size_t start = i;
+            while (i < s.size() && !isspace(s[i]) && s[i] != '(' && s[i] != ')') i++;
+            std::string word = s.substr(start, i - start);
+            if (word == ".") tokens.push_back({TOK_DOT, "."});
+            else if (is_int(word)) tokens.push_back({TOK_INT, word});
+            else tokens.push_back({TOK_SYM, word});
+        }
+    }
+    tokens.push_back({TOK_END, ""});
+    return tokens;
+}
+
+
+Object* s_read(const std::vector<Token>& tokens, int& idx);
+
+// #(...) ベクタリテラルの読み取り
+Object* s_read_vector(const std::vector<Token>& tokens, int& idx) {
+    std::vector<Object*> elems;
+    while (tokens[idx].type != TOK_RPAREN && tokens[idx].type != TOK_END) {
+        Object* elem = s_read(tokens, idx);
+        if (g_active_ctx) g_active_ctx->s.push_back(elem);
+        elems.push_back(elem);
+    }
+    if (tokens[idx].type == TOK_RPAREN) idx++;
+    Object* v = alloc(VECTOR);
+    set_vector_storage(v, new std::vector<Object*>(elems));
+    // GC ルートに積んでいた要素をすべて除去
+    if (g_active_ctx) {
+        for (size_t i = 0; i < elems.size(); ++i) g_active_ctx->s.pop_back();
+    }
+    return v;
+}
+
+Object* s_read_list(const std::vector<Token>& tokens, int& idx) {
+    if (tokens[idx].type == TOK_RPAREN) {
+        idx++;
+        return nullptr;
+    }
+
+    Object* car = s_read(tokens, idx);
+    if (g_active_ctx) g_active_ctx->s.push_back(car);
+
+    if (tokens[idx].type == TOK_DOT) {
+        idx++;
+        Object* cdr = s_read(tokens, idx);
+        if (g_active_ctx) g_active_ctx->s.push_back(cdr);
+
+        Object* res = cons(car, cdr);
+
+        if (g_active_ctx) {
+            g_active_ctx->s.pop_back();
+            g_active_ctx->s.pop_back();
+        }
+        if (tokens[idx].type == TOK_RPAREN) idx++;
+        return res;
+    }
+
+    Object* cdr = s_read_list(tokens, idx);
+    if (g_active_ctx) g_active_ctx->s.push_back(cdr);
+
+    Object* res = cons(car, cdr);
+
+    if (g_active_ctx) {
+        g_active_ctx->s.pop_back();
+        g_active_ctx->s.pop_back();
+    }
+
+    return res;
+}
+
+Object* s_read(const std::vector<Token>& tokens, int& idx) {
+    if (tokens[idx].type == TOK_LPAREN) {
+        idx++;
+        return s_read_list(tokens, idx);
+    }
+
+    if (tokens[idx].type == TOK_HASH_LPAREN) {
+        idx++;
+        return s_read_vector(tokens, idx);
+    }
+    
+    if (tokens[idx].type == TOK_QUOTE) {
+        idx++;
+        Object* quoted_val = s_read(tokens, idx);
+        if (g_active_ctx) g_active_ctx->s.push_back(quoted_val);
+        
+        Object* inner = cons(quoted_val, nullptr);
+        if (g_active_ctx) g_active_ctx->s.push_back(inner);
+        
+        Object* res = cons(get_symbol("quote"), inner);
+        
+        if (g_active_ctx) {
+            g_active_ctx->s.pop_back();
+            g_active_ctx->s.pop_back();
+        }
+        return res;
+    }
+
+    if (tokens[idx].type == TOK_BACKQUOTE) {
+        idx++;
+        return wrap_unary_form("backquote", s_read(tokens, idx));
+    }
+
+    if (tokens[idx].type == TOK_UNQUOTE) {
+        idx++;
+        return wrap_unary_form("unquote", s_read(tokens, idx));
+    }
+
+    if (tokens[idx].type == TOK_SPLICE) {
+        idx++;
+        return wrap_unary_form("splice", s_read(tokens, idx));
+    }
+
+    if (tokens[idx].type == TOK_INT) {
+        return make_int(std::stoi(tokens[idx++].str));
+    } else if (tokens[idx].type == TOK_STRING) {
+        return make_string_obj(tokens[idx++].str);
+    } else if (tokens[idx].type == TOK_SYM) {
+        return get_symbol(tokens[idx++].str);
+    }
+    return nullptr;
+}
+
+std::string s_input() {
+    std::string s_text = "";
+    int leftp = 0, rightp = 0;
+    std::string line;
+    do {
+        std::cout << (s_text == "" ? "micro-scheme> " : "             > ");
+        if (!std::getline(std::cin, line)) return "";
+        for (char c : line) {
+            if (c == '(') leftp++;
+            else if (c == ')') rightp++;
+        }
+        s_text += line + " ";
+    } while (leftp > rightp || s_text == " ");
+    return s_text;
+}
+
+// ------------------------------------------------------------
+// eval_from_source: 文字列から式を読み取り評価して結果を返す
+//
+// 手順:
+//   1. tokenize で Token 列に変換
+//   2. s_read で Scheme オブジェクトに変換
+//   3. eval_expr で評価
+//   評価中の GC でオブジェクトが回収されないよう expr と result を
+//   ctx.s（スタック）に一時的に積んでルートとして保護する
+// ------------------------------------------------------------
+Object* eval_from_source(const std::string& source, VMContext& ctx, std::vector<Object*>& /* constants) */) {
+    std::vector<Token> tokens = tokenize(source);
+    int idx = 0;
+    Object* expr = s_read(tokens, idx);
+    ctx.s.push_back(expr);   // GC ルートとして保護
+    Object* result = eval_expr(expr);
+    ctx.s.push_back(result); // GC ルートとして保護
+    return result;
+}
+
+std::vector<Object*> read_all_exprs_from_string(const std::string& text) {
+    std::vector<Token> tokens = tokenize(text);
+    std::vector<Object*> exprs;
+    int idx = 0;
+    while (idx < static_cast<int>(tokens.size()) && tokens[idx].type != TOK_END) {
+        exprs.push_back(s_read(tokens, idx));
+    }
+    return exprs;
+}
+
+static std::string normalize_load_path(const std::string& raw_path) {
+    if (raw_path.size() >= 2) {
+        char first = raw_path.front();
+        char last = raw_path.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return raw_path.substr(1, raw_path.size() - 2);
+        }
+    }
+    return raw_path;
+}
+
+bool load_scheme_file(const std::string& path) {
+    std::ifstream ifs(path);
+    if (!ifs) {
+        std::cerr << "[load] cannot open file: " << path << std::endl;
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    std::vector<Object*> exprs;
+    try {
+        exprs = read_all_exprs_from_string(content);
+    } catch (const std::exception& e) {
+        std::cerr << "[load] parse error in " << path << ": " << e.what() << std::endl;
+        return false;
+    }
+
+    // R5RS load semantics: evaluate file forms in the top-level environment.
+    // Also restore caller lexical frames after load returns.
+    EvalEnv saved_eval_env = g_eval_env_stack;
+    bool saved_disable_vm_fast_path = g_disable_vm_fast_path;
+    g_eval_env_stack.clear();
+    g_disable_vm_fast_path = true;
+    struct EvalEnvGuard {
+        EvalEnv* slot;
+        EvalEnv saved;
+        ~EvalEnvGuard() { *slot = std::move(saved); }
+    } eval_env_guard{&g_eval_env_stack, std::move(saved_eval_env)};
+    struct BoolGuard {
+        bool* slot;
+        bool saved;
+        ~BoolGuard() { *slot = saved; }
+    } vm_guard{&g_disable_vm_fast_path, saved_disable_vm_fast_path};
+
+    for (auto* expr : exprs) {
+        try {
+            eval_expr(expr);
+        } catch (const std::exception& e) {
+            std::cerr << "[load] eval error in " << path << ": " << e.what() << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+Object* prim_read_impl(std::vector<Object*>& args) {
+    std::string text;
+    if (!args.empty() && args[0] && args[0]->type == PORT && args[0]->port.file && args[0]->port.file->is_open()) {
+        std::vector<std::string> lines;
+        int depth = 0;
+        bool has_content = false;
+        std::string line;
+
+        while (std::getline(*args[0]->port.file, line)) {
+            std::string stripped;
+            stripped.reserve(line.size());
+            for (char ch : line) {
+                if (ch == ';') break;
+                stripped.push_back(ch);
+            }
+            while (!stripped.empty() && (stripped.back() == ' ' || stripped.back() == '\t' || stripped.back() == '\r')) {
+                stripped.pop_back();
+            }
+            if (stripped.empty()) continue;
+
+            for (char ch : stripped) {
+                if (ch == '(') {
+                    depth++;
+                    has_content = true;
+                } else if (ch == ')') {
+                    depth--;
+                } else if (ch != ' ' && ch != '\t') {
+                    has_content = true;
+                }
+            }
+            lines.push_back(stripped);
+            if (has_content && depth <= 0) break;
+        }
+
+        if (lines.empty()) return get_symbol(":eof");
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i > 0) text.push_back(' ');
+            text += lines[i];
+        }
+    } else {
+        if (!std::getline(std::cin, text)) return get_symbol(":eof");
+    }
+
+    if (text.empty()) return get_symbol(":eof");
+    std::vector<Token> tokens = tokenize(text);
+    int idx = 0;
+    return s_read(tokens, idx);
+}
+
+void add_prim(const std::string& name, std::function<Object*(std::vector<Object*>&)> f) {
+    Object* p = alloc(PRIMITIVE);
+    p->prim = new std::function<Object*(std::vector<Object*>&)>(f);
+    globals[name] = p;
+}
+
+// ------------------------------------------------------------
+// プリミティブ関数の登録
+//
+// register_core_primitives() で以下の組み込み関数を globals に登録する:
+//   リスト操作  : car, cdr, cons, set-car!, set-cdr!, list, pair?, null?
+//   算術        : +, -, *, /, modulo, =, <, >, <=, >=
+//   比較        : eq?, equal?, not
+//   文字列      : symbol->string, number->string, string->number, string-append
+//   表示        : display, newline
+//   リスト高階  : length, append, reverse, map, for-each, filter,
+//                 fold-left, fold-right, apply, assq, memq
+//   I/O         : open-input-file, open-output-file, close-input-port,
+//                 close-output-port, read-line, read-char, write, write-char,
+//                 write_newline, eof-object?, read, read-expr, load
+//   その他      : macroexpand-1, macroexpand, gensym, error
+// ------------------------------------------------------------
+void register_core_primitives() {
+    add_prim("car", [](std::vector<Object*>& args) {
+        if (args.size() > 0 && args[0] && args[0]->type == PAIR) return args[0]->pair.car;
+        return (Object*)nullptr;
+    });
+
+    add_prim("cdr", [](std::vector<Object*>& args) {
+        if (args.size() > 0 && args[0] && args[0]->type == PAIR) return args[0]->pair.cdr;
+        return (Object*)nullptr;
+    });
+
+    add_prim("cons", [](std::vector<Object*>& args) {
+        Object* p = alloc(PAIR);
+        if (args.size() >= 2) {
+            p->pair.car = args[0];
+            p->pair.cdr = args[1];
+        }
+        return p;
+    });
+
+    add_prim("list", [](std::vector<Object*>& args) {
+        Object* out = nullptr;
+        for (auto it = args.rbegin(); it != args.rend(); ++it) {
+            out = cons(*it, out);
+        }
+        return out;
+    });
+
+    add_prim("+", [](std::vector<Object*>& args) {
+        long long res = 0;
+        bool has_double = false;
+        long double dres = 0.0L;
+        
+        for (auto o : args) {
+            if (!o) continue;
+            if (o->type == INT) {
+                if (has_double) dres += (long double)o->num;
+                else {
+                    if (will_overflow_add((int)res, o->num)) {
+                        has_double = true;
+                        dres = (long double)res + (long double)o->num;
+                    } else {
+                        res += o->num;
+                    }
+                }
+            } else if (o->type == INT64) {
+                if (has_double) dres += (long double)o->num64;
+                else {
+                    // Check if res + o->num64 overflows long long (unlikely but possible)
+                    if ((o->num64 > 0 && res > LLONG_MAX - o->num64) ||
+                        (o->num64 < 0 && res < LLONG_MIN - o->num64)) {
+                        has_double = true;
+                        dres = (long double)res + (long double)o->num64;
+                    } else {
+                        res += o->num64;
+                    }
+                }
+            } else if (o->type == DOUBLE) {
+                has_double = true;
+                if (dres == 0.0L) dres = (long double)res;
+                dres += o->dbl;
+            }
+        }
+        
+        if (has_double) {
+            return make_number_from_double(dres);
+        } else {
+            return make_number(res);
+        }
+    });
+
+    add_prim("-", [](std::vector<Object*>& args) {
+        long long res = 0;
+        bool has_double = false;
+        long double dres = 0.0L;
+        
+        if (!args.empty() && args[0]) {
+            if (args[0]->type == INT) res = args[0]->num;
+            else if (args[0]->type == INT64) res = args[0]->num64;
+            else if (args[0]->type == DOUBLE) { has_double = true; dres = args[0]->dbl; }
+        }
+        
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i]) continue;
+            if (args[i]->type == INT) {
+                if (has_double) dres -= (long double)args[i]->num;
+                else {
+                    if (will_overflow_sub((int)res, args[i]->num)) {
+                        has_double = true;
+                        dres = (long double)res - (long double)args[i]->num;
+                    } else {
+                        res -= args[i]->num;
+                    }
+                }
+            } else if (args[i]->type == INT64) {
+                if (has_double) dres -= (long double)args[i]->num64;
+                else {
+                    if ((args[i]->num64 < 0 && res > LLONG_MAX + args[i]->num64) ||
+                        (args[i]->num64 > 0 && res < LLONG_MIN + args[i]->num64)) {
+                        has_double = true;
+                        dres = (long double)res - (long double)args[i]->num64;
+                    } else {
+                        res -= args[i]->num64;
+                    }
+                }
+            } else if (args[i]->type == DOUBLE) {
+                has_double = true;
+                if (dres == 0.0L) dres = (long double)res;
+                dres -= args[i]->dbl;
+            }
+        }
+        
+        if (has_double) {
+            return make_number_from_double(dres);
+        } else {
+            return make_number(res);
+        }
+    });
+
+    add_prim("*", [](std::vector<Object*>& args) {
+        long long res = 1;
+        bool has_double = false;
+        long double dres = 1.0L;
+        
+        for (auto o : args) {
+            if (!o) continue;
+            if (o->type == INT) {
+                if (has_double) dres *= (long double)o->num;
+                else {
+                    if (will_overflow_mul((int)res, o->num)) {
+                        has_double = true;
+                        dres = (long double)res * (long double)o->num;
+                    } else {
+                        res *= o->num;
+                    }
+                }
+            } else if (o->type == INT64) {
+                if (has_double) dres *= (long double)o->num64;
+                else {
+                    // Check overflow for long long multiplication
+                    if (res != 0 && o->num64 != 0) {
+                        if ((res > 0 && o->num64 > 0 && res > LLONG_MAX / o->num64) ||
+                            (res < 0 && o->num64 < 0 && res < LLONG_MAX / o->num64) ||
+                            (res > 0 && o->num64 < 0 && res > LLONG_MIN / o->num64) ||
+                            (res < 0 && o->num64 > 0 && res < LLONG_MIN / o->num64)) {
+                            has_double = true;
+                            dres = (long double)res * (long double)o->num64;
+                        } else {
+                            res *= o->num64;
+                        }
+                    }
+                }
+            } else if (o->type == DOUBLE) {
+                has_double = true;
+                if (dres == 1.0L) dres = (long double)res;
+                dres *= o->dbl;
+            }
+        }
+        
+        if (has_double) {
+            return make_number_from_double(dres);
+        } else {
+            return make_number(res);
+        }
+    });
+
+    add_prim("=", [](std::vector<Object*>& args) {
+        if (args.size() < 2) return bool_obj(true);
+        if (!args[0]) return bool_obj(false);
+        
+        // Get the first value
+        long double base_val;
+        if (args[0]->type == INT) base_val = (long double)args[0]->num;
+        else if (args[0]->type == INT64) base_val = (long double)args[0]->num64;
+        else if (args[0]->type == DOUBLE) base_val = args[0]->dbl;
+        else return bool_obj(false);
+        
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i]) return bool_obj(false);
+            long double val;
+            if (args[i]->type == INT) val = (long double)args[i]->num;
+            else if (args[i]->type == INT64) val = (long double)args[i]->num64;
+            else if (args[i]->type == DOUBLE) val = args[i]->dbl;
+            else return bool_obj(false);
+            
+            if (base_val != val) return bool_obj(false);
+        }
+        return bool_obj(true);
+    });
+
+    add_prim("<", [](std::vector<Object*>& args) {
+        if (args.size() < 2) return bool_obj(true);
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i - 1] || !args[i]) return bool_obj(false);
+            
+            long double prev, curr;
+            if (args[i - 1]->type == INT) prev = (long double)args[i - 1]->num;
+            else if (args[i - 1]->type == INT64) prev = (long double)args[i - 1]->num64;
+            else if (args[i - 1]->type == DOUBLE) prev = args[i - 1]->dbl;
+            else return bool_obj(false);
+            
+            if (args[i]->type == INT) curr = (long double)args[i]->num;
+            else if (args[i]->type == INT64) curr = (long double)args[i]->num64;
+            else if (args[i]->type == DOUBLE) curr = args[i]->dbl;
+            else return bool_obj(false);
+            
+            if (!(prev < curr)) return bool_obj(false);
+        }
+        return bool_obj(true);
+    });
+
+    add_prim(">", [](std::vector<Object*>& args) {
+        if (args.size() < 2) return bool_obj(true);
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i - 1] || !args[i]) return bool_obj(false);
+            
+            long double prev, curr;
+            if (args[i - 1]->type == INT) prev = (long double)args[i - 1]->num;
+            else if (args[i - 1]->type == INT64) prev = (long double)args[i - 1]->num64;
+            else if (args[i - 1]->type == DOUBLE) prev = args[i - 1]->dbl;
+            else return bool_obj(false);
+            
+            if (args[i]->type == INT) curr = (long double)args[i]->num;
+            else if (args[i]->type == INT64) curr = (long double)args[i]->num64;
+            else if (args[i]->type == DOUBLE) curr = args[i]->dbl;
+            else return bool_obj(false);
+            
+            if (!(prev > curr)) return bool_obj(false);
+        }
+        return bool_obj(true);
+    });
+
+    add_prim("<=", [](std::vector<Object*>& args) {
+        if (args.size() < 2) return bool_obj(true);
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i - 1] || !args[i]) return bool_obj(false);
+            
+            long double prev, curr;
+            if (args[i - 1]->type == INT) prev = (long double)args[i - 1]->num;
+            else if (args[i - 1]->type == INT64) prev = (long double)args[i - 1]->num64;
+            else if (args[i - 1]->type == DOUBLE) prev = args[i - 1]->dbl;
+            else return bool_obj(false);
+            
+            if (args[i]->type == INT) curr = (long double)args[i]->num;
+            else if (args[i]->type == INT64) curr = (long double)args[i]->num64;
+            else if (args[i]->type == DOUBLE) curr = args[i]->dbl;
+            else return bool_obj(false);
+            
+            if (!(prev <= curr)) return bool_obj(false);
+        }
+        return bool_obj(true);
+    });
+
+    add_prim(">=", [](std::vector<Object*>& args) {
+        if (args.size() < 2) return bool_obj(true);
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i - 1] || !args[i]) return bool_obj(false);
+            
+            long double prev, curr;
+            if (args[i - 1]->type == INT) prev = (long double)args[i - 1]->num;
+            else if (args[i - 1]->type == INT64) prev = (long double)args[i - 1]->num64;
+            else if (args[i - 1]->type == DOUBLE) prev = args[i - 1]->dbl;
+            else return bool_obj(false);
+            
+            if (args[i]->type == INT) curr = (long double)args[i]->num;
+            else if (args[i]->type == INT64) curr = (long double)args[i]->num64;
+            else if (args[i]->type == DOUBLE) curr = args[i]->dbl;
+            else return bool_obj(false);
+            
+            if (!(prev >= curr)) return bool_obj(false);
+        }
+        return bool_obj(true);
+    });
+
+    add_prim("null?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] == nullptr);
+    });
+
+    add_prim("pair?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] && args[0]->type == PAIR);
+    });
+
+    add_prim("not", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && !is_true(args[0]));
+    });
+
+    add_prim("eq?", [](std::vector<Object*>& args) {
+        return bool_obj(args.size() >= 2 && args[0] == args[1]);
+    });
+
+    add_prim("equal?", [](std::vector<Object*>& args) {
+        return bool_obj(args.size() >= 2 && objects_equal(args[0], args[1]));
+    });
+
+    add_prim("append", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        if (args.size() == 1) return args[0];
+
+        std::vector<Object*> out;
+        for (size_t i = 0; i + 1 < args.size(); ++i) {
+            Object* cur = args[i];
+            while (cur) {
+                if (cur->type != PAIR) return (Object*)nullptr;
+                out.push_back(cur->pair.car);
+                cur = cur->pair.cdr;
+            }
+        }
+
+        Object* tail = args.back();
+        Object* result = vector_to_pair(out);
+        if (!result) return tail;
+        Object* it = result;
+        while (it && it->type == PAIR && it->pair.cdr) it = it->pair.cdr;
+        if (it && it->type == PAIR) it->pair.cdr = tail;
+        return result;
+    });
+
+    add_prim("display", [](std::vector<Object*>& args) {
+        if (!args.empty()) print_obj(args[0]);
+        return (Object*)nullptr;
+    });
+
+    add_prim("newline", [](std::vector<Object*>& args) {
+        (void)args;
+        std::cout << std::endl;
+        return (Object*)nullptr;
+    });
+
+    add_prim("print", [](std::vector<Object*>& args) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (i > 0) std::cout << " ";
+            print_obj(args[i]);
+        }
+        std::cout << std::endl;
+        return args.empty() ? (Object*)nullptr : args.back();
+    });
+
+    add_prim("macroexpand-1", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        return macro_expand_1(args[0]);
+    });
+
+    add_prim("macroexpand", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        return macro_expand(args[0]);
+    });
+
+    add_prim("macroexpand-trace", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        int max_steps = 64;
+        if (args.size() >= 2 && args[1] && args[1]->type == INT) {
+            max_steps = args[1]->num;
+        }
+        return macro_expand_trace(args[0], max_steps);
+    });
+
+    add_prim("macro?", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0]) return bool_obj(false);
+        Object* x = args[0];
+        if (x->type == SYMBOL && x->sym) {
+            auto it = macros.find(*x->sym);
+            return bool_obj(it != macros.end() && it->second != nullptr);
+        }
+        for (const auto& kv : macros) {
+            if (kv.second == x) return bool_obj(true);
+        }
+        return bool_obj(false);
+    });
+
+    add_prim("macro-list", [](std::vector<Object*>& args) {
+        (void)args;
+        std::vector<std::string> names;
+        names.reserve(macros.size());
+        for (const auto& kv : macros) {
+            if (kv.second) names.push_back(kv.first);
+        }
+        std::sort(names.begin(), names.end());
+        std::vector<Object*> syms;
+        syms.reserve(names.size());
+        for (const auto& n : names) syms.push_back(get_symbol(n));
+        return vector_to_pair(syms);
+    });
+
+    // --- primitives missing from micro_scheme7 parity ---
+
+    add_prim("/", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0]) return (Object*)nullptr;
+        
+        long double result;
+        if (args[0]->type == INT) result = (long double)args[0]->num;
+        else if (args[0]->type == INT64) result = (long double)args[0]->num64;
+        else if (args[0]->type == DOUBLE) result = args[0]->dbl;
+        else return (Object*)nullptr;
+        
+        if (args.size() == 1) {
+            if (result == 0.0L) return (Object*)nullptr;
+            result = 1.0L / result;
+        } else {
+            for (size_t i = 1; i < args.size(); ++i) {
+                if (!args[i]) return (Object*)nullptr;
+                long double divisor;
+                if (args[i]->type == INT) divisor = (long double)args[i]->num;
+                else if (args[i]->type == INT64) divisor = (long double)args[i]->num64;
+                else if (args[i]->type == DOUBLE) divisor = args[i]->dbl;
+                else return (Object*)nullptr;
+                
+                if (divisor == 0.0L) return (Object*)nullptr;
+                result /= divisor;
+            }
+        }
+        return make_number_from_double(result);
+    });
+
+    add_prim("modulo", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[0] || !args[1]) return (Object*)nullptr;
+        
+        long long a, b;
+        if (args[0]->type == INT) a = (long long)args[0]->num;
+        else if (args[0]->type == INT64) a = args[0]->num64;
+        else return (Object*)nullptr;
+        
+        if (args[1]->type == INT) b = (long long)args[1]->num;
+        else if (args[1]->type == INT64) b = args[1]->num64;
+        else return (Object*)nullptr;
+        
+        if (b == 0) return (Object*)nullptr;
+        return make_number(a % b);
+    });
+
+    add_prim("set-car!", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        args[0]->pair.car = args[1];
+        return args[1];
+    });
+
+    add_prim("set-cdr!", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        args[0]->pair.cdr = args[1];
+        return args[1];
+    });
+
+    add_prim("eqv?", [](std::vector<Object*>& args) {
+        if (args.size() != 2) return bool_obj(false);
+        if (args[0] == args[1]) return bool_obj(true);
+        if (!args[0] || !args[1]) return bool_obj(false);
+        if (args[0]->type == INT && args[1]->type == INT) return bool_obj(args[0]->num == args[1]->num);
+        return bool_obj(false);
+    });
+
+    add_prim("symbol?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] && args[0]->type == SYMBOL);
+    });
+
+    add_prim("string?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] && args[0]->type == STRING);
+    });
+
+    add_prim("number?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] && 
+                       (args[0]->type == INT || args[0]->type == INT64 || args[0]->type == DOUBLE));
+    });
+
+    add_prim("integer?", [](std::vector<Object*>& args) {
+        return bool_obj(!args.empty() && args[0] && 
+                       (args[0]->type == INT || args[0]->type == INT64));
+    });
+
+    add_prim("procedure?", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0]) return bool_obj(false);
+        return bool_obj(args[0]->type == PRIMITIVE || args[0]->type == CLOSURE || args[0]->type == CONTINUATION);
+    });
+
+    add_prim("reverse", [](std::vector<Object*>& args) {
+        if (args.empty()) return (Object*)nullptr;
+        std::vector<Object*> items = pair_to_vector(args[0]);
+        std::reverse(items.begin(), items.end());
+        return vector_to_pair(items);
+    });
+
+    add_prim("length", [](std::vector<Object*>& args) {
+        if (args.empty()) return make_int(0);
+        int len = 0;
+        Object* cur = args[0];
+        while (cur && cur->type == PAIR) { len++; cur = cur->pair.cdr; }
+        return make_int(len);
+    });
+
+    add_prim("apply", [](std::vector<Object*>& args) {
+        if (args.size() < 2 || !args[0]) return (Object*)nullptr;
+        std::vector<Object*> prefix(args.begin() + 1, args.end() - 1);
+        std::vector<Object*> tail = pair_to_vector(args.back());
+        prefix.insert(prefix.end(), tail.begin(), tail.end());
+        return invoke_callable(args[0], prefix);
+    });
+
+    add_prim("memq", [](std::vector<Object*>& args) {
+        if (args.size() != 2) return bool_obj(false);
+        Object* key = args[0];
+        Object* cur = args[1];
+        while (cur && cur->type == PAIR) {
+            if (cur->pair.car == key) return cur;
+            cur = cur->pair.cdr;
+        }
+        return bool_obj(false);
+    });
+
+    add_prim("assq", [](std::vector<Object*>& args) {
+        if (args.size() != 2) return bool_obj(false);
+        Object* key = args[0];
+        Object* cur = args[1];
+        while (cur && cur->type == PAIR) {
+            Object* pair = cur->pair.car;
+            if (pair && pair->type == PAIR && pair->pair.car == key) return pair;
+            cur = cur->pair.cdr;
+        }
+        return bool_obj(false);
+    });
+
+    add_prim("list-tail", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[1] || args[1]->type != INT) return (Object*)nullptr;
+        int n = args[1]->num;
+        Object* cur = args[0];
+        while (n-- > 0 && cur && cur->type == PAIR) cur = cur->pair.cdr;
+        return cur;
+    });
+
+    add_prim("list-ref", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[1] || args[1]->type != INT) return (Object*)nullptr;
+        int n = args[1]->num;
+        Object* cur = args[0];
+        while (n-- > 0 && cur && cur->type == PAIR) cur = cur->pair.cdr;
+        return (cur && cur->type == PAIR) ? cur->pair.car : (Object*)nullptr;
+    });
+
+    int gensym_counter = 0;
+    add_prim("gensym", [gensym_counter](std::vector<Object*>& args) mutable {
+        std::string prefix = "g";
+        if (!args.empty() && args[0] && args[0]->type == SYMBOL && args[0]->sym) prefix = *args[0]->sym;
+        std::string name = prefix + std::to_string(++gensym_counter);
+        return make_symbol_obj(name);
+    });
+
+    add_prim("number->string", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != INT) return (Object*)nullptr;
+        return make_symbol_obj(std::to_string(args[0]->num));
+    });
+
+    add_prim("string->number", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != SYMBOL || !args[0]->sym) return bool_obj(false);
+        try {
+            int n = std::stoi(*args[0]->sym);
+            return make_int(n);
+        } catch (...) {
+            return bool_obj(false);
+        }
+    });
+
+    add_prim("string->symbol", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != SYMBOL || !args[0]->sym) return (Object*)nullptr;
+        return get_symbol(*args[0]->sym);
+    });
+
+    add_prim("symbol->string", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != SYMBOL || !args[0]->sym) return (Object*)nullptr;
+        return make_symbol_obj(*args[0]->sym);
+    });
+
+    add_prim("error", [](std::vector<Object*>& args) {
+        std::string msg = "error";
+        if (!args.empty() && args[0] && args[0]->type == SYMBOL && args[0]->sym) msg = *args[0]->sym;
+        std::cerr << "[error] " << msg << std::endl;
+        for (size_t i = 1; i < args.size(); ++i) {
+            std::cerr << " ";
+            print_obj(args[i]);
+        }
+        std::cerr << std::endl;
+        return (Object*)nullptr;
+    });
+
+    add_prim("caar",  [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* a = args[0]->pair.car;
+        return (a && a->type == PAIR) ? a->pair.car : (Object*)nullptr;
+    });
+    add_prim("cadr",  [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* d = args[0]->pair.cdr;
+        return (d && d->type == PAIR) ? d->pair.car : (Object*)nullptr;
+    });
+    add_prim("cdar",  [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* a = args[0]->pair.car;
+        return (a && a->type == PAIR) ? a->pair.cdr : (Object*)nullptr;
+    });
+    add_prim("cddr",  [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* d = args[0]->pair.cdr;
+        return (d && d->type == PAIR) ? d->pair.cdr : (Object*)nullptr;
+    });
+    add_prim("caddr", [](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* d1 = args[0]->pair.cdr;
+        if (!d1 || d1->type != PAIR) return (Object*)nullptr;
+        Object* d2 = d1->pair.cdr;
+        return (d2 && d2->type == PAIR) ? d2->pair.car : (Object*)nullptr;
+    });
+    add_prim("cadddr",[](std::vector<Object*>& args) {
+        if (args.empty() || !args[0] || args[0]->type != PAIR) return (Object*)nullptr;
+        Object* cur = args[0]->pair.cdr;
+        for (int i = 0; i < 2 && cur && cur->type == PAIR; ++i) cur = cur->pair.cdr;
+        return (cur && cur->type == PAIR) ? cur->pair.car : (Object*)nullptr;
+    });
+
+    add_prim("open-input-file", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0]) return (Object*)nullptr;
+        std::string path;
+        if (args[0]->type == STRING && args[0]->str) path = *args[0]->str;
+        else if (args[0]->type == SYMBOL && args[0]->sym) path = normalize_load_path(*args[0]->sym);
+        else return (Object*)nullptr;
+
+        Object* p = alloc(PORT);
+        p->port.is_output = false;
+        p->port.file = new std::fstream(path, std::ios::in);
+        if (!p->port.file->is_open()) {
+            delete p->port.file;
+            p->port.file = nullptr;
+            return (Object*)nullptr;
+        }
+        return p;
+    });
+
+    add_prim("open-output-file", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0]) return (Object*)nullptr;
+        std::string path;
+        if (args[0]->type == STRING && args[0]->str) path = *args[0]->str;
+        else if (args[0]->type == SYMBOL && args[0]->sym) path = normalize_load_path(*args[0]->sym);
+        else return (Object*)nullptr;
+
+        Object* p = alloc(PORT);
+        p->port.is_output = true;
+        p->port.file = new std::fstream(path, std::ios::out | std::ios::trunc);
+        if (!p->port.file->is_open()) {
+            delete p->port.file;
+            p->port.file = nullptr;
+            return (Object*)nullptr;
+        }
+        return p;
+    });
+
+    auto prim_close_port = [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0] || args[0]->type != PORT || !args[0]->port.file) return get_symbol(":undef");
+        if (args[0]->port.file->is_open()) args[0]->port.file->close();
+        return get_symbol(":undef");
+    };
+    add_prim("close-input-port", prim_close_port);
+    add_prim("close-output-port", prim_close_port);
+
+    add_prim("read-line", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0] || args[0]->type != PORT || !args[0]->port.file) return get_symbol(":eof");
+        std::string line;
+        if (!std::getline(*args[0]->port.file, line)) return get_symbol(":eof");
+        return make_string_obj(line);
+    });
+
+    add_prim("read-char", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0] || args[0]->type != PORT || !args[0]->port.file) return get_symbol(":eof");
+        int ch = args[0]->port.file->get();
+        if (ch == EOF) return get_symbol(":eof");
+        return make_string_obj(std::string(1, static_cast<char>(ch)));
+    });
+
+    add_prim("write", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[1] || args[1]->type != PORT || !args[1]->port.file) return get_symbol(":undef");
+        *args[1]->port.file << object_to_string(args[0]);
+        return get_symbol(":undef");
+    });
+
+    add_prim("write_newline", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0] || args[0]->type != PORT || !args[0]->port.file) return get_symbol(":undef");
+        *args[0]->port.file << '\n';
+        return get_symbol(":undef");
+    });
+
+    add_prim("write-char", [](std::vector<Object*>& args) {
+        if (args.size() != 2 || !args[1] || args[1]->type != PORT || !args[1]->port.file) return get_symbol(":undef");
+        if (!args[0]) return get_symbol(":undef");
+
+        char ch;
+        if (args[0]->type == STRING && args[0]->str && !args[0]->str->empty()) {
+            ch = (*args[0]->str)[0];
+        } else if (args[0]->type == SYMBOL && args[0]->sym && !args[0]->sym->empty()) {
+            ch = (*args[0]->sym)[0];
+        } else {
+            return get_symbol(":undef");
+        }
+
+        *args[1]->port.file << ch;
+        return get_symbol(":undef");
+    });
+
+    add_prim("eof-object?", [](std::vector<Object*>& args) {
+        if (args.size() != 1) return bool_obj(false);
+        return bool_obj(is_symbol_name(args[0], ":eof"));
+    });
+
+    add_prim("read", [](std::vector<Object*>& args) {
+        return prim_read_impl(args);
+    });
+
+    add_prim("read-expr", [](std::vector<Object*>& args) {
+        return prim_read_impl(args);
+    });
+
+    add_prim("load", [](std::vector<Object*>& args) {
+        if (args.size() != 1 || !args[0]) return get_symbol(":undef");
+
+        std::string path;
+        if (args[0]->type == STRING && args[0]->str) {
+            path = *args[0]->str;
+        } else if (args[0]->type == SYMBOL && args[0]->sym) {
+            path = normalize_load_path(*args[0]->sym);
+        } else {
+            return get_symbol(":undef");
+        }
+
+        load_scheme_file(path);
+        return get_symbol(":undef");
+    });
+
+        // ============================================================
+        // Vector primitives (micro_scheme9 addition)
+        // ============================================================
+
+        // (make-vector n [fill])  => #(fill fill ... fill)
+        add_prim("make-vector", [](std::vector<Object*>& args) {
+            if (args.empty() || !args[0] || args[0]->type != INT) return (Object*)nullptr;
+            int n = args[0]->num;
+            if (n < 0) return (Object*)nullptr;
+            Object* fill = (args.size() >= 2) ? args[1] : nullptr;
+            Object* v = alloc(VECTOR);
+            set_vector_storage(v, new std::vector<Object*>(static_cast<size_t>(n), fill));
+            return v;
+        });
+
+        // (vector e0 e1 ...) => #(e0 e1 ...)
+        add_prim("vector", [](std::vector<Object*>& args) {
+            Object* v = alloc(VECTOR);
+            set_vector_storage(v, new std::vector<Object*>(args));
+            return v;
+        });
+
+        // (vector? obj) => #t/#f
+        add_prim("vector?", [](std::vector<Object*>& args) {
+            return bool_obj(!args.empty() && args[0] && args[0]->type == VECTOR);
+        });
+
+        // (vector-length v) => 要素数
+        add_prim("vector-length", [](std::vector<Object*>& args) {
+            if (args.empty() || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return make_int(0);
+            return make_int(static_cast<int>(args[0]->vec->size()));
+        });
+
+        // (vector-ref v i) => v[i]
+        add_prim("vector-ref", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
+            if (!args[1] || args[1]->type != INT) return (Object*)nullptr;
+            size_t idx = static_cast<size_t>(args[1]->num);
+            if (idx >= args[0]->vec->size()) throw VMError("vector-ref: index out of range");
+            return (*args[0]->vec)[idx];
+        });
+
+        // (vector-set! v i x) => x
+        add_prim("vector-set!", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 3 || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
+            if (!args[1] || args[1]->type != INT) return (Object*)nullptr;
+            size_t idx = static_cast<size_t>(args[1]->num);
+            if (idx >= args[0]->vec->size()) throw VMError("vector-set!: index out of range");
+            (*args[0]->vec)[idx] = args[2];
+            return args[2];
+        });
+
+        // (vector-fill! v fill) => v
+        add_prim("vector-fill!", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
+            std::fill(args[0]->vec->begin(), args[0]->vec->end(), args[1]);
+            return args[0];
+        });
+
+        // (vector-copy v) => シャローコピー
+        add_prim("vector-copy", [](std::vector<Object*>& args) -> Object* {
+            if (args.empty() || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
+            Object* v = alloc(VECTOR);
+            set_vector_storage(v, new std::vector<Object*>(*args[0]->vec));
+            return v;
+        });
+
+        // (vector->list v) => (e0 e1 ...)
+        add_prim("vector->list", [](std::vector<Object*>& args) -> Object* {
+            if (args.empty() || !args[0] || args[0]->type != VECTOR || !args[0]->vec) return (Object*)nullptr;
+            return vector_to_pair(*args[0]->vec);
+        });
+
+        // (list->vector lst) => #(e0 e1 ...)
+        add_prim("list->vector", [](std::vector<Object*>& args) -> Object* {
+            if (args.empty()) return (Object*)nullptr;
+            std::vector<Object*> items = pair_to_vector(args[0]);
+            Object* v = alloc(VECTOR);
+            set_vector_storage(v, new std::vector<Object*>(items));
+            return v;
+        });
+
+        // (vector-sort pred v) => ソート済み新ベクタ  (pred a b) が真なら a が先
+        add_prim("vector-sort", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || !args[1] || args[1]->type != VECTOR || !args[1]->vec)
+                return (Object*)nullptr;
+            Object* pred = args[0];
+            Object* v = alloc(VECTOR);
+            set_vector_storage(v, new std::vector<Object*>(*args[1]->vec));
+            std::stable_sort(v->vec->begin(), v->vec->end(), [&](Object* a, Object* b) {
+                std::vector<Object*> cmp_args = {a, b};
+                Object* result = invoke_callable(pred, cmp_args);
+                return is_true(result);
+            });
+            return v;
+        });
+
+        // (vector-sort! pred v) => v 自体をソート（破壊的）
+        add_prim("vector-sort!", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || !args[1] || args[1]->type != VECTOR || !args[1]->vec)
+                return (Object*)nullptr;
+            Object* pred = args[0];
+            Object* v = args[1];
+            std::stable_sort(v->vec->begin(), v->vec->end(), [&](Object* a, Object* b) {
+                std::vector<Object*> cmp_args = {a, b};
+                Object* result = invoke_callable(pred, cmp_args);
+                return is_true(result);
+            });
+            return v;
+        });
+
+        // (vector-for-each proc v)  各要素に proc を適用（副作用用）
+        add_prim("vector-for-each", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || !args[1] || args[1]->type != VECTOR || !args[1]->vec)
+                return (Object*)nullptr;
+            Object* proc = args[0];
+            for (auto& elem : *args[1]->vec) {
+                std::vector<Object*> one = {elem};
+                invoke_callable(proc, one);
+            }
+            return (Object*)nullptr;
+        });
+
+        // (vector-map proc v) => 各要素に proc を適用した新しいベクタ
+        add_prim("vector-map", [](std::vector<Object*>& args) -> Object* {
+            if (args.size() < 2 || !args[0] || !args[1] || args[1]->type != VECTOR || !args[1]->vec)
+                return (Object*)nullptr;
+            Object* proc = args[0];
+            Object* result = alloc(VECTOR);
+            set_vector_storage(result, new std::vector<Object*>());
+            result->vec->reserve(args[1]->vec->size());
+            for (auto& elem : *args[1]->vec) {
+                std::vector<Object*> one = {elem};
+                g_vector_slot_count++;
+                result->vec->push_back(invoke_callable(proc, one));
+            }
+            return result;
+        });
+    }
+
+// ------------------------------------------------------------
+// 初期化: init_env
+//
+// 1. true / false / :undef / :eof 等の組み込み定数を globals に登録
+// 2. register_core_primitives() でプリミティブ関数を登録
+// 3. load_mlib=true のとき mlib9.scm を読み込んで
+//    let, and, or, cond, map, fold 等の高レベル機能を定義する
+// ------------------------------------------------------------
+void init_env(bool load_mlib = true) {
+    globals["true"] = alloc(INT); globals["true"]->num = 1;
+    globals["false"] = alloc(INT); globals["false"]->num = 0;
+    globals[":undef"] = get_symbol(":undef");
+    globals[":eof"] = get_symbol(":eof");
+
+    register_core_primitives();
+
+    if (load_mlib) {
+        VMContext bootstrap_ctx;
+        std::vector<Object*> bootstrap_constants;
+        VMContext* prev_ctx = g_active_ctx;
+        std::vector<Object*>* prev_constants = g_active_constants;
+        g_active_ctx = &bootstrap_ctx;
+        g_active_constants = &bootstrap_constants;
+
+        // Load only C++-adjusted mlib9.scm.
+        {
+            const char* mlib = "mlib9.scm";
+            std::ifstream probe(mlib);
+            if (probe.good()) {
+                probe.close();
+                load_scheme_file(mlib);
+            }
+        }
+
+        g_active_ctx = prev_ctx;
+        g_active_constants = prev_constants;
+    }
+
+    // Ensure bootstrap evaluation does not leak lexical frames.
+    g_eval_env_stack.clear();
+}
+
+void cleanup_heap() {
+    for (auto* obj : heap) {
+        delete obj;
+    }
+    heap.clear();
+    int_cache.clear();
+    g_eval_env_stack.clear();
+    g_closure_lexenv.clear();
+}
+
+// mlib7.scm 相当の総合テスト (scheme7 run_self_tests と同等)
+int run_full_selftest() {
+    init_env(true);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    int failures = 0;
+    auto expect_eq = [&](const std::string& expr, const std::string& expected) {
+        test_ctx.s.clear();
+        Object* result = eval_from_source(expr, test_ctx, constants);
+        std::string got;
+        if (!result) got = "nil";
+        else if (result->type == INT) got = (result->num ? (result->num == 1 && expected == "true" ? "true" : (result->num == 0 && expected == "false" ? "false" : std::to_string(result->num))) : "false");
+        else got = object_to_string(result);
+        // normalize bool display
+        if (result && result->type == INT) {
+            if (expected == "true" && result->num != 0) got = "true";
+            else if (expected == "false" && result->num == 0) got = "false";
+            else got = std::to_string(result->num);
+        }
+        if (got != expected) {
+            failures++;
+            std::cout << "[selftest-full][FAIL] " << expr
+                      << "  expected=" << expected << "  got=" << got << std::endl;
+        } else {
+            std::cout << "[selftest-full][PASS] " << expr << std::endl;
+        }
+    };
+
+    // --- basics ---
+    expect_eq("(+ 1 2)", "3");
+    expect_eq("(* 6 7)", "42");
+    expect_eq("((lambda (a b) (+ a b)) 3 4)", "7");
+    expect_eq("((lambda (x) (+ x 1)) 3)", "4");
+    expect_eq("(if true 10 20)", "10");
+    expect_eq("(if false 10 20)", "20");
+    expect_eq("(quote a)", "a");
+    expect_eq("(car (quote (a b c)))", "a");
+    expect_eq("(cdr (quote (a b c)))", "(b c)");
+    expect_eq("(cons (quote a) (quote b))", "(a . b)");
+    expect_eq("(eq? (quote a) (quote a))", "true");
+    expect_eq("(eq? (quote a) (quote b))", "false");
+    expect_eq("(pair? (quote (a b c)))", "true");
+    expect_eq("(pair? (quote a))", "false");
+    expect_eq("(list (quote a) (quote b) (quote c) (quote d) (quote e))", "(a b c d e)");
+    // --- define / set! ---
+    expect_eq("(define x 9)", "x");
+    expect_eq("x", "9");
+    expect_eq("(set! x 7)", "7");
+    expect_eq("x", "7");
+    // --- call/cc ---
+    expect_eq("(+ 100 (call/cc (lambda (k) (k 23))))", "123");
+    expect_eq("(call/cc (lambda (k) 5))", "5");
+    expect_eq("(+ 1 (call/cc (lambda (k) (k 41))))", "42");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", "222");
+    // --- varargs ---
+    expect_eq("((lambda x x) 1 2 3)", "(1 2 3)");
+    expect_eq("((lambda (a b . r) r) 1 2 3 4)", "(3 4)");
+    expect_eq("((lambda (a b . r) (set! r (quote (9 8))) r) 1 2 3 4)", "(9 8)");
+    // --- apply / arithmetic ---
+    expect_eq("(apply + 1 (quote (2 3)))", "6");
+    expect_eq("(/ 8 2)", "4");
+    expect_eq("(modulo 7 3)", "1");
+    // --- set-car!/set-cdr! ---
+    expect_eq("(let ((p (cons (quote a) (quote b)))) (set-car! p (quote z)) p)", "(z . b)");
+    expect_eq("(let ((p (cons (quote a) (quote b)))) (set-cdr! p (quote z)) p)", "(a . z)");
+    // --- list ops ---
+    expect_eq("(append (quote (a b c)) (quote (d e f)))", "(a b c d e f)");
+    expect_eq("(append (quote ((a b) (c d))) (quote (e f g)))", "((a b) (c d) e f g)");
+    expect_eq("(reverse (quote (a b c d e)))", "(e d c b a)");
+    expect_eq("(reverse (quote ((a b) c (d e))))", "((d e) c (a b))");
+    expect_eq("(memq (quote a) (quote (a b c d e)))", "(a b c d e)");
+    expect_eq("(memq (quote c) (quote (a b c d e)))", "(c d e)");
+    expect_eq("(memq (quote f) (quote (a b c d e)))", "false");
+    expect_eq("(assq (quote a) (quote ((a 1) (b 2) (c 3) (d 4) (e 5))))", "(a 1)");
+    expect_eq("(assq (quote e) (quote ((a 1) (b 2) (c 3) (d 4) (e 5))))", "(e 5)");
+    expect_eq("(assq (quote f) (quote ((a 1) (b 2) (c 3) (d 4) (e 5))))", "false");
+    // --- map / filter ---
+    expect_eq("(map car (quote ((a 1) (b 2) (c 3) (d 4) (e 5))))", "(a b c d e)");
+    expect_eq("(map cdr (quote ((a 1) (b 2) (c 3) (d 4) (e 5))))", "((1) (2) (3) (4) (5))");
+    expect_eq("(map (lambda (x) (cons x x)) (quote (a b c d e)))", "((a . a) (b . b) (c . c) (d . d) (e . e))");
+    expect_eq("(filter (lambda (x) (not (eq? x (quote a)))) (quote (a b c a b c a b c)))", "(b c b c b c)");
+    // --- fold ---
+    expect_eq("(fold-left cons (quote ()) (quote (a b c d e)))", "(((((nil . a) . b) . c) . d) . e)");
+    expect_eq("(fold-right cons (quote ()) (quote (a b c d e)))", "(a b c d e)");
+    // --- let / let* / letrec ---
+    expect_eq("(let ((a 10) (b 20)) (cons a b))", "(10 . 20)");
+    expect_eq("(let* ((a 10) (b 20) (c (cons a b))) c)", "(10 . 20)");
+    expect_eq("(letrec ((a a)) a)", ":undef");
+    expect_eq("(begin)", ":undef");
+    expect_eq("(begin 1 2 3 4 5)", "5");
+    // --- and / or ---
+    expect_eq("(and 1 2 3)", "3");
+    expect_eq("(and false 2 3)", "false");
+    expect_eq("(and 1 false 3)", "false");
+    expect_eq("(or 1 2 3)", "1");
+    expect_eq("(or false 2 3)", "2");
+    expect_eq("(or false false 3)", "3");
+    expect_eq("(or false false false)", "false");
+    // --- backquote ---
+    expect_eq("(define a (quote (1 2 3)))", "a");
+    expect_eq("`(a b c)", "(a b c)");
+    expect_eq("`(,a b c)", "((1 2 3) b c)");
+    expect_eq("`(,@a b c)", "(1 2 3 b c)");
+    expect_eq("`(,(car a) b c)", "(1 b c)");
+    expect_eq("`(,(cdr a) b c)", "((2 3) b c)");
+    expect_eq("`(,@(cdr a) b c)", "(2 3 b c)");
+    // --- define-macro / macroexpand ---
+    expect_eq("(define-macro id (lambda (x) x))", "id");
+    expect_eq("(macroexpand-1 (quote (id 42)))", "42");
+    expect_eq("(macroexpand (quote (id (quote a))))", "(quote a)");
+    expect_eq("(id (quote (1 2)))", "(1 2)");
+    // --- cond / when / unless / case ---
+    expect_eq("(cond ((= 1 2) 10) ((= 1 1) 42) (else 0))", "42");
+    expect_eq("(when true 99)", "99");
+    expect_eq("(unless false 88)", "88");
+    expect_eq("(case 2 ((1) 10) ((2) 20) (else 30))", "20");
+    // --- named let / do ---
+    expect_eq("(let loop ((n 5) (acc 1)) (if (= n 0) acc (loop (- n 1) (* acc n))))", "120");
+    expect_eq("(do ((i 0 (+ i 1)) (s 0 (+ s i))) ((= i 5) s))", "10");
+
+    // --- mlib utility coverage (map-2 / delay-force / tree / iterator) ---
+    expect_eq("(map-2 + (list 1 2 3) (list 4 5 6))", "(5 7 9)");
+    expect_eq("(map-2 cons (quote (a b)) (quote (1 2)))", "((a . 1) (b . 2))");
+    expect_eq("(begin (define p (delay (+ 1 2))) (force p))", "3");
+    expect_eq("(begin (define cnt 0) (define p (delay (begin (set! cnt (+ cnt 1)) 42))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
+    expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(begin (define it0 (make-iter (lambda (yield) (yield 9)))) (list (it0) (it0)))", "(9 0)");
+    // Test call/cc iterator state management: cnt should be 0 before first yield,
+    // then incremented between yields, unlike buffer-based iterators.
+    expect_eq("(begin (define cnt 0) (define it (make-iter (lambda (yield) (set! cnt (+ cnt 1)) (yield cnt) (set! cnt (+ cnt 1)) (yield cnt)))) (list cnt (it) cnt (it) cnt (it)))", "(0 1 1 2 2 0)");
+
+    if (failures == 0) {
+        std::cout << "[selftest-full] all tests passed." << std::endl;
+    } else {
+        std::cout << "[selftest-full] " << failures << " test(s) FAILED." << std::endl;
+    }
+    std::cout << "[selftest-full] compilation: " << g_vm_subset_success_count << " success, "
+              << g_vm_subset_failure_count << " fallback to evaluator" << std::endl;
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_mlib_utils_selftest() {
+    init_env(true);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    int failures = 0;
+    auto expect_eq = [&](const std::string& expr, const std::string& expected) {
+        test_ctx.s.clear();
+        Object* result = eval_from_source(expr, test_ctx, constants);
+        std::string got;
+        if (!result) got = "nil";
+        else if (result->type == INT) got = (result->num ? (result->num == 1 && expected == "true" ? "true" : (result->num == 0 && expected == "false" ? "false" : std::to_string(result->num))) : "false");
+        else got = object_to_string(result);
+
+        if (result && result->type == INT) {
+            if (expected == "true" && result->num != 0) got = "true";
+            else if (expected == "false" && result->num == 0) got = "false";
+            else got = std::to_string(result->num);
+        }
+
+        if (got != expected) {
+            failures++;
+            std::cout << "[selftest-mlib-utils][FAIL] " << expr
+                      << "  expected=" << expected << "  got=" << got << std::endl;
+        } else {
+            std::cout << "[selftest-mlib-utils][PASS] " << expr << std::endl;
+        }
+    };
+
+    expect_eq("(map-2 + (list 1 2 3) (list 4 5 6))", "(5 7 9)");
+    expect_eq("(map-2 cons (quote (a b)) (quote (1 2)))", "((a . 1) (b . 2))");
+    expect_eq("(begin (define p (delay (+ 1 2))) (force p))", "3");
+    expect_eq("(begin (define cnt 0) (define p (delay (begin (set! cnt (+ cnt 1)) 42))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define cnt 0) (define p (make-promise (lambda () (begin (set! cnt (+ cnt 1)) 7)))) (force p) (force p) cnt)", "1");
+    expect_eq("(begin (define out (quote ())) (for-each-tree (lambda (x) (set! out (cons x out))) (quote (1 (2 3) (4 (5))))) out)", "(5 4 3 2 1)");
+    expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(begin (define it0 (make-iter (lambda (yield) (yield 9)))) (list (it0) (it0)))", "(9 0)");
+    // Test call/cc iterator state management: cnt should be 0 before first yield,
+    // then incremented between yields, unlike buffer-based iterators.
+    expect_eq("(begin (define cnt 0) (define it (make-iter (lambda (yield) (set! cnt (+ cnt 1)) (yield cnt) (set! cnt (+ cnt 1)) (yield cnt)))) (list cnt (it) cnt (it) cnt (it)))", "(0 1 1 2 2 0)");
+
+    if (failures == 0) {
+        std::cout << "[selftest-mlib-utils] all tests passed." << std::endl;
+    } else {
+        std::cout << "[selftest-mlib-utils] " << failures << " test(s) FAILED." << std::endl;
+    }
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_callcc_selftest() {
+    init_env(true);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    int failures = 0;
+    auto expect_eq = [&](const std::string& expr, const std::string& expected) {
+        test_ctx.s.clear();
+        Object* result = eval_from_source(expr, test_ctx, constants);
+        std::string got;
+        if (!result) got = "nil";
+        else if (result->type == INT) got = (result->num ? (result->num == 1 && expected == "true" ? "true" : (result->num == 0 && expected == "false" ? "false" : std::to_string(result->num))) : "false");
+        else got = object_to_string(result);
+
+        if (result && result->type == INT) {
+            if (expected == "true" && result->num != 0) got = "true";
+            else if (expected == "false" && result->num == 0) got = "false";
+            else got = std::to_string(result->num);
+        }
+
+        if (got != expected) {
+            failures++;
+            std::cout << "[selftest-callcc][FAIL] " << expr
+                      << "  expected=" << expected << "  got=" << got << std::endl;
+        } else {
+            std::cout << "[selftest-callcc][PASS] " << expr << std::endl;
+        }
+    };
+
+    // ---- existing tests ----
+    expect_eq("(+ 100 (call/cc (lambda (k) (k 23))))", "123");
+    expect_eq("(call/cc (lambda (k) 5))", "5");
+    expect_eq("(+ 1 (call/cc (lambda (k) (k 41))))", "42");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", "222");
+    expect_eq("(begin (define it (make-iter (lambda (yield ls) (for-each yield ls)) (list 10 20 30))) (list (it) (it) (it) (it)))", "(10 20 30 0)");
+    expect_eq("(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 1)))) (if (= first 1) (saved 2) (if (= first 2) (saved 3) first))))", "3");
+
+    // ---- classic call/cc examples ----
+
+    // Ex1: basic escape -- call/cc used as early exit from a loop
+    // find-negative: return first negative number, or false if none
+    expect_eq(
+        "(begin"
+        "  (define find-negative"
+        "    (lambda (lst)"
+        "      (call/cc"
+        "        (lambda (exit)"
+        "          (let loop ((ls lst))"
+        "            (cond ((null? ls) false)"
+        "                  ((< (car ls) 0) (exit (car ls)))"
+        "                  (else (loop (cdr ls)))))))))"
+        "  (list (find-negative '(3 1 -5 2))"
+        "        (find-negative '(1 2 3))))",
+        "(-5 0)");  // false == 0
+
+    // Ex2: non-local exit from recursive search (member via call/cc)
+    expect_eq(
+        "(begin"
+        "  (define my-member"
+        "    (lambda (x lst)"
+        "      (call/cc"
+        "        (lambda (return)"
+        "          (letrec ((loop (lambda (ls)"
+        "                          (cond ((null? ls) false)"
+        "                                ((equal? (car ls) x) (return ls))"
+        "                                (else (loop (cdr ls)))))))"
+        "            (loop lst))))))"
+        "  (list (length (my-member 'b '(a b c d)))"
+        "        (my-member 'z '(a b c))))",
+        "(3 0)");  // (b c d) length=3; false=0
+
+    // Ex3: saved continuation re-invoked (counter)
+    // Each re-invocation sets val to cnt, increments cnt, loops until cnt>=4.
+    // Result: val when (>= cnt 4) first holds => cnt=4, val=3 (last saved call arg).
+    expect_eq(
+        "(let ((saved false) (cnt 0))"
+        "  (let ((val (call/cc (lambda (k) (set! saved k) 0))))"
+        "    (set! cnt (+ cnt 1))"
+        "    (if (< cnt 4)"
+        "        (saved cnt)"
+        "        val)))",
+        "3");
+
+    // Ex4: short-circuit product -- exit immediately on zero
+    expect_eq(
+        "(begin"
+        "  (define product"
+        "    (lambda (lst)"
+        "      (call/cc"
+        "        (lambda (exit)"
+        "          (let loop ((ls lst))"
+        "            (cond ((null? ls) 1)"
+        "                  ((= (car ls) 0) (exit 0))"
+        "                  (else (* (car ls) (loop (cdr ls))))))))))"
+        "  (list (product '(1 2 3 4))"
+        "        (product '(1 2 0 99))))",
+        "(24 0)");
+
+    // Ex5: multi-shot generator using call/cc (explicit yields, no for-each)
+    expect_eq(
+        "(begin"
+        "  (define gen"
+        "    (make-iter"
+        "      (lambda (yield)"
+        "        (yield 10)"
+        "        (yield 20)"
+        "        (yield 30))))"
+        "  (list (gen) (gen) (gen) (gen)))",
+        "(10 20 30 0)");
+
+    // Ex6: call/cc for exception-like early return from nested calls
+    expect_eq(
+        "(begin"
+        "  (define with-escape"
+        "    (lambda (thunk)"
+        "      (call/cc"
+        "        (lambda (escape)"
+        "          (thunk escape)))))"
+        "  (list"
+        "    (with-escape (lambda (e) (e 42) 999))"
+        "    (with-escape (lambda (e) (+ 1 (e 7) 999)))))",
+        "(42 7)");
+
+    if (failures == 0) {
+        std::cout << "[selftest-callcc] all tests passed." << std::endl;
+    } else {
+        std::cout << "[selftest-callcc] " << failures << " test(s) FAILED." << std::endl;
+    }
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_gc_selftest() {
+    init_env(false);
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+
+    for (int i = 0; i < 200; ++i) {
+        Object* n = make_int(i);
+        test_ctx.s.push_back(n);
+        if (test_ctx.s.size() > 3) {
+            test_ctx.s.erase(test_ctx.s.begin());
+        }
+    }
+
+    gc(test_ctx, constants);
+    std::cout << "[selftest] heap size after gc: " << heap.size() << std::endl;
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return 0;
+}
+
+int run_eval_selftest() {
+    init_env(true);   // map/for-each/fold are defined in mlib9.scm
+    VMContext test_ctx;
+    std::vector<Object*> constants;
+    g_active_ctx = &test_ctx;
+    g_active_constants = &constants;
+    g_vm_subset_success_count = 0;
+
+    struct EvalCase {
+        std::string expr;
+        int expected_int;
+    };
+
+    struct ErrorCase {
+        std::string expr;
+        std::string expected_substr;
+    };
+
+    const std::vector<EvalCase> cases = {
+        {"(begin (define x 1) (set! x (+ x 2)) x)", 3},
+        {"(let ((x 10)) x)", 10},
+        {"(let* ((x 2) (y (+ x 3))) y)", 5},
+        {"(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))", 120},
+        {"(letrec ((even? (lambda (n) (if (= n 0) 1 (odd? (- n 1))))) (odd? (lambda (n) (if (= n 0) 0 (even? (- n 1)))))) (even? 6))", 1},
+        {"(begin (define (inc x) (+ x 1)) (inc 41))", 42},
+        {"(begin (define-macro (id x) x) (id 8))", 8},
+        {"(begin (define-macro (id x) x) (macroexpand-1 '(id 9)))", 9},
+        {"(begin (define-macro (id x) x) (macroexpand '(id (id 3))))", 3},
+        {"(begin (define-macro (id x) x) (id 7))", 7},
+        {"(begin (define q `(1 ,(+ 1 2) 4)) (car (cdr q)))", 3},
+        {"(call/cc (lambda (k) (k 9) 5))", 9},
+        {"(let ((saved false)) (let ((first (call/cc (lambda (k) (set! saved k) 111)))) (if (= first 111) (saved 222) first)))", 222},
+        // new parity cases
+        {"(/ 10 2)", 5},
+        {"(modulo 10 3)", 1},
+        {"(begin (define p (cons 1 2)) (set-car! p 7) (car p))", 7},
+        {"(begin (define p (cons 1 2)) (set-cdr! p 8) (cdr p))", 8},
+        {"(length (list 1 2 3))", 3},
+        {"(car (reverse (list 1 2 3)))", 3},
+        {"(cadr (list 10 20 30))", 20},
+        {"(begin (define (sq x) (* x x)) (car (map sq (list 2 3))))", 4},
+        {"(begin (define r 0) (for-each (lambda (x) (set! r (+ r x))) (list 1 2 3)) r)", 6},
+        {"(apply + (list 1 2 3))", 6},
+        {"(fold-left + 0 (list 1 2 3 4))", 10},
+        {"(fold-right - 0 (list 1))", 1},
+        // and / or
+        {"(and 1 2 3)", 3},
+        {"(and 1 false 3)", 0},
+        {"(or false false 5)", 5},
+        {"(or false false false)", 0},
+        // cond
+        {"(cond ((= 1 2) 10) ((= 1 1) 42) (else 0))", 42},
+        {"(cond (else 7))", 7},
+        // when / unless
+        {"(begin (define r 0) (when true (set! r 1)) r)", 1},
+        {"(begin (define r 0) (unless false (set! r 2)) r)", 2},
+        // case
+        {"(case 2 ((1) 10) ((2) 20) (else 30))", 20},
+        // named let
+        {"(let loop ((n 5) (acc 1)) (if (= n 0) acc (loop (- n 1) (* acc n))))", 120},
+        // do
+        {"(do ((i 0 (+ i 1)) (s 0 (+ s i))) ((= i 5) s))", 10},
+        {"(letrec ((fact (lambda (n a) (if (= n 0) a (fact (- n 1) (* a n)))))) (> (fact 40 1) 0))", 1}
+    };
+
+    const std::vector<ErrorCase> error_cases = {
+        {"aaa", "unbound symbol: aaa"},
+        {"(inverse '(1 2 3))", "unbound function: inverse"}
+    };
+
+    int failures = 0;
+    int vm_used_cases = 0;
+    for (const auto& tc : cases) {
+        test_ctx.s.clear();
+        int before_vm = g_vm_subset_success_count;
+        Object* result = eval_from_source(tc.expr, test_ctx, constants);
+        bool used_vm = g_vm_subset_success_count > before_vm;
+        if (used_vm) vm_used_cases++;
+        if (g_trace_selftest_route) {
+            std::cout << "[selftest-eval][ROUTE] " << (used_vm ? "vm" : "evaluator") << " expr=" << tc.expr << std::endl;
+        }
+        if (!result || result->type != INT || result->num != tc.expected_int) {
+            failures++;
+            std::cout << "[selftest-eval][FAIL] expr=" << tc.expr << " expected=" << tc.expected_int << " got=";
+            if (result && result->type == INT) std::cout << result->num;
+            else print_obj(result);
+            std::cout << std::endl;
+        }
+    }
+
+    if (g_vm_subset_success_count == 0) {
+        failures++;
+        std::cout << "[selftest-eval][FAIL] vm subset route was not used" << std::endl;
+    }
+
+    for (const auto& tc : error_cases) {
+        test_ctx.s.clear();
+        bool caught = false;
+        bool matched = false;
+        try {
+            (void)eval_from_source(tc.expr, test_ctx, constants);
+        } catch (const std::exception& e) {
+            caught = true;
+            matched = std::string(e.what()).find(tc.expected_substr) != std::string::npos;
+            if (!matched) {
+                failures++;
+                std::cout << "[selftest-eval][FAIL] expr=" << tc.expr
+                          << " expected error containing='" << tc.expected_substr
+                          << "' got='" << e.what() << "'" << std::endl;
+            }
+        }
+        if (!caught) {
+            failures++;
+            std::cout << "[selftest-eval][FAIL] expr=" << tc.expr
+                      << " expected error containing='" << tc.expected_substr
+                      << "' but evaluation succeeded" << std::endl;
+        }
+    }
+
+    if (failures == 0) {
+        std::cout << "[selftest-eval] all tests passed ("
+                  << (cases.size() + error_cases.size()) << ")" << std::endl;
+    }
+
+    std::cout << "[selftest-eval] vm route used in " << vm_used_cases << "/" << cases.size() << " cases" << std::endl;
+    std::cout << "[selftest-eval] compilation: " << g_vm_subset_success_count << " success, "
+              << g_vm_subset_failure_count << " fallback to evaluator" << std::endl;
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    g_active_ctx = nullptr;
+    g_active_constants = nullptr;
+    return failures == 0 ? 0 : 1;
+}
+
+int run_compare_mlib_selftest() {
+    std::vector<std::string> cases;
+    cases.reserve(360);
+
+    // arithmetic / predicate cases
+    for (int i = 0; i < 120; ++i) {
+        int a = i;
+        int b = (i * 3 + 7) % 29;
+        int c = (i * 5 + 11) % 17;
+        cases.push_back("(+ " + std::to_string(a) + " (* " + std::to_string(b) + " " + std::to_string(c) + "))");
+        cases.push_back("(if (> " + std::to_string(a) + " " + std::to_string(b) + ") " + std::to_string(a) + " " + std::to_string(b) + ")");
+    }
+
+    // let / let* / letrec / named-let / do
+    for (int i = 0; i < 80; ++i) {
+        int n = (i % 7) + 1;
+        int x = (i * 7 + 3) % 23;
+        int y = (i * 11 + 5) % 19;
+        cases.push_back("(let ((x " + std::to_string(x) + ") (y " + std::to_string(y) + ")) (+ x y))");
+        cases.push_back("(let* ((x " + std::to_string(x) + ") (y (+ x " + std::to_string(n) + "))) (* y 2))");
+        cases.push_back("(let loop ((n " + std::to_string(n) + ") (acc 1)) (if (= n 0) acc (loop (- n 1) (* acc n))))");
+        cases.push_back("(do ((i 0 (+ i 1)) (s 0 (+ s i))) ((= i " + std::to_string(n + 3) + ") s))");
+    }
+
+    // list / higher-order cases
+    for (int i = 0; i < 60; ++i) {
+        int a = (i % 9) + 1;
+        int b = ((i * 2) % 9) + 1;
+        int c = ((i * 3) % 9) + 1;
+        int d = ((i * 5) % 9) + 1;
+        std::string lst = "(list " + std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(c) + " " + std::to_string(d) + ")";
+        cases.push_back("(car (reverse " + lst + "))");
+        cases.push_back("(fold-left + 0 " + lst + ")");
+        cases.push_back("(fold-right + 0 " + lst + ")");
+        cases.push_back("(length (filter (lambda (x) (> x " + std::to_string((i % 4) + 2) + ")) " + lst + "))");
+    }
+
+    auto run_suite = [&](bool load_mlib, std::vector<std::string>& out_results) {
+        out_results.clear();
+        out_results.reserve(cases.size());
+
+        for (const auto& expr : cases) {
+            init_env(load_mlib);
+            VMContext test_ctx;
+            std::vector<Object*> constants;
+            g_active_ctx = &test_ctx;
+            g_active_constants = &constants;
+
+            std::string got;
+            try {
+                Object* result = eval_from_source(expr, test_ctx, constants);
+                if (!result) got = "nil";
+                else got = object_to_string(result);
+            } catch (const std::exception& e) {
+                got = std::string("<error:") + e.what() + ">";
+            } catch (...) {
+                got = "<error:unknown>";
+            }
+            out_results.push_back(got);
+
+            cleanup_heap();
+            globals.clear();
+            macros.clear();
+            symbols.clear();
+            g_active_ctx = nullptr;
+            g_active_constants = nullptr;
+        }
+    };
+
+    std::vector<std::string> no_mlib_results;
+    std::vector<std::string> with_mlib_results;
+    run_suite(false, no_mlib_results);
+    run_suite(true, with_mlib_results);
+
+    auto is_missing_without_mlib = [](const std::string& s) {
+        return s.rfind("<error:unbound function:", 0) == 0 ||
+               s.rfind("<error:unbound symbol:", 0) == 0;
+    };
+
+    int mismatches = 0;
+    int compared = 0;
+    int skipped = 0;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        if (is_missing_without_mlib(no_mlib_results[i])) {
+            skipped++;
+            continue;
+        }
+        compared++;
+        if (no_mlib_results[i] != with_mlib_results[i]) {
+            mismatches++;
+            if (mismatches <= 20) {
+                std::cout << "[selftest-mlib-compare][DIFF] idx=" << i
+                          << " expr=" << cases[i]
+                          << " no_mlib=" << no_mlib_results[i]
+                          << " with_mlib=" << with_mlib_results[i] << std::endl;
+            }
+        }
+    }
+
+    std::cout << "[selftest-mlib-compare] total_cases=" << cases.size()
+              << " compared=" << compared
+              << " skipped_missing_without_mlib=" << skipped
+              << " mismatches=" << mismatches << std::endl;
+    std::cout << "[selftest-mlib-compare] compilation: " << g_vm_subset_success_count << " success, "
+              << g_vm_subset_failure_count << " fallback to evaluator" << std::endl;
+    if (mismatches == 0) {
+        std::cout << "[selftest-mlib-compare] all results identical." << std::endl;
+        return 0;
+    }
+    return 1;
+}
+
+// ------------------------------------------------------------
+// main: エントリポイント
+//
+// 起動オプション:
+//   --selftest       : GC の簡易セルフテストを実行
+//   --selftest-eval  : 評価器・コンパイラの動作テストを実行
+//   --selftest-full  : mlib を含む総合テストを実行
+//   --selftest-mlib-compare : mlib あり/なしの結果差分を比較
+//   --selftest-mlib-utils   : mlib ユーティリティの回帰テストを実行
+//   --selftest-callcc       : call/cc 周辺の集中回帰テストを実行
+//   (引数なし)       : REPL を起動
+//
+// REPL ループ:
+//   1. s_input() で入力を読む（括弧が閉じるまで複数行対応）
+//   2. eval_from_source() で評価（内部でコンパイラ→VM が動く）
+//   3. 結果と Heap size を表示
+//   4. "exit" または EOF で終了
+// ------------------------------------------------------------
+int main(int argc, char** argv) {
+    if (const char* trace_env = std::getenv("MS_TRACE_LETREC")) {
+        std::string v(trace_env);
+        g_trace_letrec = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
+    }
+    if (const char* trace_callcc_env = std::getenv("MS_TRACE_CALLCC")) {
+        std::string v(trace_callcc_env);
+        g_trace_callcc = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
+    }
+    if (const char* trace_vm_env = std::getenv("MS_TRACE_VM_ALL")) {
+        std::string v(trace_vm_env);
+        if (!(v.empty() || v == "0" || v == "false" || v == "FALSE")) {
+            g_trace_vm_session = 1;
+        }
+    }
+    if (const char* trace_selftest_route_env = std::getenv("MS_TRACE_SELFTEST_ROUTE")) {
+        std::string v(trace_selftest_route_env);
+        g_trace_selftest_route = !(v.empty() || v == "0" || v == "false" || v == "FALSE");
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--selftest") {
+        return run_gc_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-eval") {
+        return run_eval_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-full") {
+        return run_full_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-mlib-compare") {
+        return run_compare_mlib_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-mlib-utils") {
+        return run_mlib_utils_selftest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--selftest-callcc") {
+        return run_callcc_selftest();
+    }
+
+    init_env();
+
+    VMContext repl_ctx;
+    std::vector<Object*> constants; 
+
+    g_active_ctx = &repl_ctx;
+    g_active_constants = &constants;
+
+    while (true) {
+        std::string input = s_input();
+        if (input == "" || input.find("exit") != std::string::npos) break;
+
+        try {
+            clear_transient_eval_state(&repl_ctx);
+            std::vector<Token> tokens = tokenize(input);
+            int idx = 0;
+            Object* expr = s_read(tokens, idx);
+
+            repl_ctx.s.push_back(expr);
+            Object* result = eval_from_source(input, repl_ctx, constants);
+            repl_ctx.s.push_back(result);
+
+            print_obj(result);
+            std::cout << std::endl;
+            clear_transient_eval_state(&repl_ctx);
+
+            std::cout << "\nHeap size: " << heap.size()
+                      << "  Weight: " << effective_heap_weight()
+                      << "  LexEnv: " << g_closure_lexenv.size()
+                      << "\n\n";
+        } catch (const ParseError& e) {
+            clear_transient_eval_state(&repl_ctx);
+            std::cout << "Parse Error: " << e.what() << std::endl;
+        } catch (const VMError& e) {
+            clear_transient_eval_state(&repl_ctx);
+            std::cout << "VM Error: " << e.what() << std::endl;
+        } catch (const std::exception& e) {
+            clear_transient_eval_state(&repl_ctx);
+            std::cout << "Error: " << e.what() << std::endl;
+        }
+    }
+
+    cleanup_heap();
+    globals.clear();
+    macros.clear();
+    symbols.clear();
+    int_cache.clear();
+}
+
+
